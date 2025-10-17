@@ -1,0 +1,213 @@
+=== Running UDP TURN Demo ===
+Target: 8.8.8.8:53
+TURN Server: world.relay.skype.com:3478
+[+] Starting UDP TURN client...
+[+] Resolved world.relay.skype.com to 20.202.20.44
+[+] Using TURN server: ('20.202.20.44', 3478)
+[+] Discovering all IPs for world.relay.skype.com
+[+] System DNS: world.relay.skype.com -> 20.202.20.44
+[+] DNS query via 8.8.4.4: world.relay.skype.com -> 20.202.24.79
+[+] DNS query via 208.67.220.220: world.relay.skype.com -> 20.202.23.26
+[+] DNS query via 8.8.4.4: world.relay.skype.com -> 20.202.24.65
+[+] DNS query via 1.0.0.1: world.relay.skype.com -> 20.202.24.77
+[+] DNS query via 208.67.222.222: world.relay.skype.com -> 20.202.24.76
+[+] DNS query via 208.67.220.220: world.relay.skype.com -> 20.202.21.67
+[+] DNS query via 8.8.8.8: world.relay.skype.com -> 20.202.20.1
+[+] DNS query via 1.0.0.1: world.relay.skype.com -> 20.202.20.38
+[+] DNS query via 1.1.1.1: world.relay.skype.com -> 20.202.26.1
+[+] DNS query via 8.8.4.4: world.relay.skype.com -> 20.202.24.67
+[+] DNS query via 8.8.4.4: world.relay.skype.com -> 20.202.24.64
+[+] DNS query via 1.1.1.1: world.relay.skype.com -> 20.202.26.2
+[+] Total discovered 13 IPs: ['20.202.24.65', '20.202.26.1', '20.202.20.1', '20.202.20.44', '20.202.21.67', '20.202.24.64', '20.202.24.76', '20.202.24.67', '20.202.24.77', '20.202.24.79', '20.202.20.38', '20.202.23.26', '20.202.26.2']
+[+] Trying 13 IP addresses for TURN server
+[+] Attempt 1/13: Trying ('20.202.24.65', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'sbE818RWlQEcXG3k', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%\x1f'}
+[+] Got nonce=b'sbE818RWlQEcXG3k', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'abc6+rcep2qCEBIz', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%\x1f'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca251f
+[+] Found alternate server: 53.216.129.93:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.129.93:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.24.65', 3478)
+[+] Attempt 2/13: Trying ('20.202.26.1', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'5sxzb33ghJP48AG9', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca\x1cX'}
+[+] Got nonce=b'5sxzb33ghJP48AG9', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'Z87nuCTmw1HyhsCM', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca\x1cX'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca1c58
+[+] Found alternate server: 53.216.184.26:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.184.26:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.26.1', 3478)
+[+] Attempt 3/13: Trying ('20.202.20.1', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'2rSXmhnmUi7NyMJ5', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xcaxy'}
+[+] Got nonce=b'2rSXmhnmUi7NyMJ5', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'elFCvHJhNX6pcoyk', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xcaxy'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca7879
+[+] Found alternate server: 53.216.220.59:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.220.59:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.20.1', 3478)
+[+] Attempt 4/13: Trying ('20.202.20.44', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'OfqQhhMdDd8bbROi', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xcax_'}
+[+] Got nonce=b'OfqQhhMdDd8bbROi', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'vc3eAKXihffXf8V/', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xcax_'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca785f
+[+] Found alternate server: 53.216.220.29:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.220.29:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.20.44', 3478)
+[+] Attempt 5/13: Trying ('20.202.21.67', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'7xkcSHhPr2/cj6se', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca \xd8'}
+[+] Got nonce=b'7xkcSHhPr2/cj6se', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'zcSWm+r0K+pIXLkv', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca \xd8'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca20d8
+[+] Found alternate server: 53.216.132.154:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.132.154:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.21.67', 3478)
+[+] Attempt 6/13: Trying ('20.202.24.64', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'F6WTXzzfhqaCqQra', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%0'}
+[+] Got nonce=b'F6WTXzzfhqaCqQra', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'1p6oBYGAn4SxpWip', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%0'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca2530
+[+] Found alternate server: 53.216.129.114:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.129.114:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.24.64', 3478)
+[+] Attempt 7/13: Trying ('20.202.24.76', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'LdZiuDPPcZA6NV7X', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%\xd8'}
+[+] Got nonce=b'LdZiuDPPcZA6NV7X', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'7UTOu/PttIisIXEi', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%\xd8'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca25d8
+[+] Found alternate server: 53.216.129.154:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.129.154:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.24.76', 3478)
+[+] Attempt 8/13: Trying ('20.202.24.67', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'VHGrm6rgss7uPOKR', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%)'}
+[+] Got nonce=b'VHGrm6rgss7uPOKR', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'2U244vZ2509BC1gl', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%)'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca2529
+[+] Found alternate server: 53.216.129.107:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.129.107:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.24.67', 3478)
+[+] Attempt 9/13: Trying ('20.202.24.77', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'Bm3SFeFzuT+E7tS3', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%I'}
+[+] Got nonce=b'Bm3SFeFzuT+E7tS3', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'weKw0Y6v9B1R57d0', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%I'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca2549
+[+] Found alternate server: 53.216.129.11:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.129.11:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.24.77', 3478)
+[+] Attempt 10/13: Trying ('20.202.24.79', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'ztjMfLkyOKGdHMox', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%_'}
+[+] Got nonce=b'ztjMfLkyOKGdHMox', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'3756JOVjCdX759zv', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca%_'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca255f
+[+] Found alternate server: 53.216.129.29:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.129.29:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.24.79', 3478)
+[+] Attempt 11/13: Trying ('20.202.20.38', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'lmjhH0AdiV5iqWHB', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xcax['}
+[+] Got nonce=b'lmjhH0AdiV5iqWHB', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'hSDvW6L3VkW0uQUP', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xcax['}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca785b
+[+] Found alternate server: 53.216.220.25:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.220.25:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.20.38', 3478)
+[+] Attempt 12/13: Trying ('20.202.23.26', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'RBNkVcCiSggkL9SZ', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca\x17#'}
+[+] Got nonce=b'RBNkVcCiSggkL9SZ', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'lmwbzk5pKp6sibRw', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca\x17#'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca1723
+[+] Found alternate server: 53.216.179.97:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.179.97:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.23.26', 3478)
+[+] Attempt 13/13: Trying ('20.202.26.2', 3478)
+[+] First resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'vj+OGk50Wq3c/lLo', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca\x1cV'}
+[+] Got nonce=b'vj+OGk50Wq3c/lLo', realm=b'rtcmedia'
+[+] HMAC key string: AgAAJCcnDAAB3EQ4KP/LnAVgW/wzqVzaeOyK8/Z+2pcAAAAAeWn82Sineb3VW/h1P0YAfo8Kk2k=:rtcmedia:HBbEsG843s/MWI9qs4xyLctsXSc=
+[+] HMAC key: afae1db7407a3a6e7bf4e1bd0a8515b1
+[+] Final resp attrs: {9: b'\x00\x00\x03\x00Try Alternate', 21: b'pKjSVCM+ut3CJdHU', 20: b'rtcmedia', 32802: b'20250922.05-521c3a', 32803: b'\x00\x01\r\x96\x14\xca\x1cV'}
+[-] UDP TURN allocation failed: Error response
+[-] Error: 300 Try Alternate
+[+] Received Try Alternate error, checking for alternate server...
+[+] Found ALTERNATE-SERVER attribute: 00010d9614ca1c56
+[+] Found alternate server: 53.216.184.20:11396
+[+] Recursively trying ALTERNATE-SERVER 53.216.184.20:11396
+[-] Allocation failed: timed out
+[-] Failed to allocate on ('20.202.26.2', 3478)
+[-] All IP addresses failed, trying TCP as fallback...
+[+] Discovering all IPs for 20.202.20.44
+[+] Input is IP address: 20.202.20.44
+[+] Trying 1 IP addresses for TCP TURN server
+[+] TCP Attempt 1/1: Trying ('20.202.20.44', 3478)
+[-] TCP allocation failed: timed out
+[-] Failed to allocate TCP on ('20.202.20.44', 3478)
+[-] All TCP IP addresses failed
+[-] Failed to allocate TURN relay
