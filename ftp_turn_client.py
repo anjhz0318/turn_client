@@ -8,18 +8,21 @@ import socket
 import argparse
 import sys
 import re
-from turn_client import (
+from turn_utils import (
     allocate_tcp, tcp_connection_bind, tcp_send_data, tcp_receive_data,
     resolve_server_address, resolve_peer_address, tcp_connect
 )
 from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
 
 class FTPTURNClient:
-    def __init__(self, ftp_host, ftp_port=21, turn_server=None, turn_port=None):
+    def __init__(self, ftp_host, ftp_port=21, turn_server=None, turn_port=None, turn_username=None, turn_password=None, turn_realm=None):
         self.ftp_host = ftp_host
         self.ftp_port = ftp_port
         self.turn_server = turn_server or DEFAULT_TURN_SERVER
         self.turn_port = turn_port or DEFAULT_TURN_PORT
+        self.turn_username = turn_username
+        self.turn_password = turn_password
+        self.turn_realm = turn_realm
         
         self.control_sock = None
         self.data_sock = None
@@ -40,12 +43,12 @@ class FTPTURNClient:
         
         try:
             # 1. 分配TCP TURN中继地址
-            result = allocate_tcp(server_address)
+            result = allocate_tcp(server_address, self.turn_username, self.turn_password, self.turn_realm)
             if not result:
                 print("[-] Failed to allocate TCP TURN relay")
                 return False
                 
-            self.control_sock, nonce, realm, integrity_key = result
+            self.control_sock, nonce, realm, integrity_key, actual_server_address = result
             print("[+] TCP TURN allocation successful")
             
             # 2. 发起TCP连接到FTP服务器
@@ -58,7 +61,7 @@ class FTPTURNClient:
             print(f"[+] Initiating TCP connection to {self.ftp_host}:{self.ftp_port}")
             print(f"[+] Resolved peer {self.ftp_host} to {peer_ip}")
             
-            connection_id = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.ftp_port)
+            connection_id = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.ftp_port, self.turn_username)
             if not connection_id:
                 print("[-] Failed to initiate TCP connection")
                 self.control_sock.close()
@@ -69,11 +72,11 @@ class FTPTURNClient:
             # 3. 建立数据连接
             self.data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_sock.settimeout(10)
-            self.data_sock.connect(server_address)
+            self.data_sock.connect(actual_server_address)
             print("[+] Data connection established")
             
             # 4. 绑定数据连接到对等方连接
-            if not tcp_connection_bind(self.data_sock, nonce, realm, integrity_key, connection_id, server_address):
+            if not tcp_connection_bind(self.data_sock, nonce, realm, integrity_key, connection_id, actual_server_address, self.turn_username):
                 print("[-] Failed to bind data connection")
                 self.data_sock.close()
                 self.control_sock.close()
@@ -284,12 +287,12 @@ class FTPTURNClient:
                 return None
                 
             # 分配新的TCP TURN中继
-            result = allocate_tcp(server_address)
+            result = allocate_tcp(server_address, self.turn_username, self.turn_password, self.turn_realm)
             if not result:
                 print("[-] Failed to allocate data TCP TURN relay")
                 return None
                 
-            control_sock, nonce, realm, integrity_key = result
+            control_sock, nonce, realm, integrity_key, actual_server_address = result
             
             # 连接到FTP数据端口
             peer_ip = resolve_peer_address(data_ip)
@@ -298,7 +301,7 @@ class FTPTURNClient:
                 control_sock.close()
                 return None
                 
-            connection_id = tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, data_port)
+            connection_id = tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, data_port, self.turn_username)
             if not connection_id:
                 print("[-] Failed to initiate data TCP connection")
                 control_sock.close()
@@ -307,10 +310,10 @@ class FTPTURNClient:
             # 建立数据连接
             data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             data_sock.settimeout(30)
-            data_sock.connect(server_address)
+            data_sock.connect(actual_server_address)
             
             # 绑定数据连接
-            if not tcp_connection_bind(data_sock, nonce, realm, integrity_key, connection_id, server_address):
+            if not tcp_connection_bind(data_sock, nonce, realm, integrity_key, connection_id, actual_server_address, self.turn_username):
                 print("[-] Failed to bind data connection")
                 data_sock.close()
                 control_sock.close()
@@ -382,6 +385,9 @@ def main():
     parser.add_argument("--download", help="Download file")
     parser.add_argument("--turn-server", help="TURN server hostname")
     parser.add_argument("--turn-port", type=int, help="TURN server port")
+    parser.add_argument("--turn-username", help="TURN server username")
+    parser.add_argument("--turn-password", help="TURN server password")
+    parser.add_argument("--turn-realm", help="TURN server realm")
     
     args = parser.parse_args()
     
@@ -395,7 +401,10 @@ def main():
         ftp_host=args.ftp_host,
         ftp_port=args.ftp_port,
         turn_server=args.turn_server,
-        turn_port=args.turn_port
+        turn_port=args.turn_port,
+        turn_username=args.turn_username,
+        turn_password=args.turn_password,
+        turn_realm=args.turn_realm
     )
     
     try:

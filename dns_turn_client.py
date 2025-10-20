@@ -7,11 +7,13 @@ import socket
 import struct
 import time
 import argparse
-from turn_client import (
+from turn_utils import (
     allocate, 
+    allocate_tcp_udp,
     create_permission, 
     channel_bind, 
     channel_data,
+    channel_data_tcp,
     resolve_server_address
 )
 from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
@@ -19,7 +21,7 @@ from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
 class DNSTURNClient:
     """通过UDP TURN转发DNS查询的客户端"""
     
-    def __init__(self, dns_server_ip, dns_server_port=53, turn_server=None, turn_port=None, username=None, password=None, realm=None):
+    def __init__(self, dns_server_ip, dns_server_port=53, turn_server=None, turn_port=None, username=None, password=None, realm=None, use_tcp_udp=False, use_tls=False):
         self.dns_server_ip = dns_server_ip
         self.dns_server_port = dns_server_port
         self.turn_server = turn_server
@@ -27,6 +29,8 @@ class DNSTURNClient:
         self.username = username
         self.password = password
         self.realm = realm
+        self.use_tcp_udp = use_tcp_udp
+        self.use_tls = use_tls
         self.sock = None
         self.nonce = None
         self.realm = None
@@ -48,25 +52,34 @@ class DNSTURNClient:
         
         print(f"[+] Using TURN server: {server_address}")
         
-        # 1. 分配UDP TURN资源
-        result = allocate(server_address, self.username, self.password, self.realm)
-        if not result:
-            print("[-] Failed to allocate UDP TURN relay")
-            return False
+        # 1. 分配TURN资源
+        if self.use_tcp_udp:
+            result = allocate_tcp_udp(server_address, self.username, self.password, self.realm, self.use_tls, self.turn_server)
+            if not result:
+                print("[-] Failed to allocate TCP+UDP TURN relay")
+                return False
+        else:
+            result = allocate(server_address, self.username, self.password, self.realm)
+            if not result:
+                print("[-] Failed to allocate UDP TURN relay")
+                return False
             
-        self.sock, self.nonce, self.realm, self.integrity_key = result
-        print("[+] UDP TURN allocation successful")
+        self.sock, self.nonce, self.realm, self.integrity_key, self.actual_server_address = result
+        if self.use_tcp_udp:
+            print("[+] TCP+UDP TURN allocation successful")
+        else:
+            print("[+] UDP TURN allocation successful")
         
         # 2. 创建权限，允许向DNS服务器发送数据
         if not create_permission(self.sock, self.nonce, self.realm, self.integrity_key, 
-                               self.dns_server_ip, self.dns_server_port, server_address):
+                               self.dns_server_ip, self.dns_server_port, self.actual_server_address, self.username):
             print("[-] Failed to create permission")
             self.sock.close()
             return False
             
         # 3. 绑定通道
         if not channel_bind(self.sock, self.nonce, self.realm, self.integrity_key, 
-                          self.dns_server_ip, self.dns_server_port, self.channel_number, server_address):
+                          self.dns_server_ip, self.dns_server_port, self.channel_number, self.actual_server_address, self.username):
             print("[-] Failed to bind channel")
             self.sock.close()
             return False
@@ -167,7 +180,10 @@ class DNSTURNClient:
         """接收DNS响应"""
         try:
             self.sock.settimeout(timeout)
-            data, addr = self.sock.recvfrom(1024)
+            if self.use_tcp_udp:
+                data = self.sock.recv(1024)
+            else:
+                data, addr = self.sock.recvfrom(1024)
             
             # 检查是否是ChannelData消息
             if len(data) >= 4:
@@ -202,9 +218,14 @@ class DNSTURNClient:
         query_packet, transaction_id = self.build_dns_query(domain, query_type)
         
         # 通过TURN通道发送查询
-        if not channel_data(self.sock, self.channel_number, query_packet, server_address):
-            print("[-] Failed to send DNS query")
-            return None
+        if self.use_tcp_udp:
+            if not channel_data_tcp(self.sock, self.channel_number, query_packet, self.actual_server_address):
+                print("[-] Failed to send DNS query")
+                return None
+        else:
+            if not channel_data(self.sock, self.channel_number, query_packet, self.actual_server_address):
+                print("[-] Failed to send DNS query")
+                return None
             
         print(f"[+] DNS query sent, waiting for response...")
         
@@ -264,20 +285,32 @@ def main():
     parser.add_argument('--domain', required=True, help='要查询的域名')
     parser.add_argument('--query-type', type=int, default=1, 
                        help='查询类型: 1=A记录, 28=AAAA记录, 15=MX记录, 2=NS记录 (默认: 1)')
+    parser.add_argument('--mode', choices=['udp', 'tcp-udp'], default='udp', 
+                       help='TURN模式: udp (UDP TURN), tcp-udp (TCP连接+UDP中继) (默认: udp)')
+    parser.add_argument('--tls', action='store_true', help='使用TLS加密连接')
     
     args = parser.parse_args()
     
-    print("=== DNS Client via UDP TURN ===")
+    # 确定使用的模式
+    use_tcp_udp = (args.mode == 'tcp-udp')
+    
+    if use_tcp_udp:
+        print("=== DNS Client via TCP+UDP TURN ===")
+    else:
+        print("=== DNS Client via UDP TURN ===")
     print(f"DNS Server: {args.dns_server}:{args.dns_port}")
     if args.turn_server:
         print(f"TURN Server: {args.turn_server}:{args.turn_port or DEFAULT_TURN_PORT}")
     else:
         print(f"TURN Server: {DEFAULT_TURN_SERVER}:{DEFAULT_TURN_PORT} (default)")
+    print(f"Mode: {args.mode}")
+    if args.tls:
+        print("TLS: Enabled")
     print(f"Domain: {args.domain}")
     print(f"Query Type: {args.query_type}")
     
     # 创建DNS TURN客户端
-    dns_client = DNSTURNClient(args.dns_server, args.dns_port, args.turn_server, args.turn_port, args.username, args.password, args.realm)
+    dns_client = DNSTURNClient(args.dns_server, args.dns_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, use_tcp_udp, args.tls)
     
     try:
         # 建立连接
@@ -332,7 +365,7 @@ def test_multiple_queries():
     ]
     
     # 创建DNS TURN客户端
-    dns_client = DNSTURNClient(args.dns_server, args.dns_port, args.turn_server, args.turn_port, args.username, args.password, args.realm)
+    dns_client = DNSTURNClient(args.dns_server, args.dns_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, False, False)
     
     try:
         # 建立连接

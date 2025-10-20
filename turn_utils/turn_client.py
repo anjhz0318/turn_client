@@ -22,6 +22,7 @@ import hmac
 import hashlib
 import random
 import os
+import sys
 import zlib
 import dns.resolver
 import dns.exception
@@ -29,6 +30,8 @@ import time
 
 # === 配置 ===
 # 从配置文件导入TURN服务器配置
+# 添加父目录到路径，以便导入config模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT, USERNAME, PASSWORD, REALM,
     DEFAULT_TIMEOUT, DEFAULT_CHANNEL_NUMBER
@@ -503,16 +506,15 @@ def allocate(server_address=None, username=None, password=None, realm=None, serv
         else:
             print(f"[-] Failed to allocate on {current_address}")
     
-    print("[-] All IP addresses failed, trying TCP as fallback...")
-    # 如果所有UDP都失败，尝试TCP
-    return allocate_tcp(server_address, username, password, realm)
+    print("[-] All UDP IP addresses failed")
+    return None
+
 
 def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False):
-    """向单个服务器分配TCP TURN中继地址"""
+    """向单个服务器分配TCP TURN中继地址（使用TCP传输）"""
     # 使用传入的认证信息或默认值
     auth_username = username or USERNAME
     auth_password = password or PASSWORD
-    # 不使用传入的realm，只使用服务器返回的realm
         
     # TCP TURN需要先建立TCP控制连接
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -536,7 +538,7 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
         # 1. 第一次 Allocate 请求（无认证）
         tid1 = gen_tid()
         req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (UDP=17)
+            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (TCP=6)
         ])
         control_sock.send(req1)
         
@@ -563,7 +565,7 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
             stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
             stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
             stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (UDP=17, RFC8565规定中继流量总是UDP)
+            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (TCP=6, RFC6062规定TCP使用TCP传输)
         ]
 
         req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
@@ -775,6 +777,7 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
         control_sock.close()
         return None
 
+
 def allocate_tcp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None):
     """分配TCP TURN中继地址，支持多IP备选和自动重试"""
     if server_address is None:
@@ -840,9 +843,17 @@ def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, ser
     ]
     
     req = build_msg(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
-    sock.sendto(req, server_address)
     
-    data, _ = sock.recvfrom(2000)
+    # 检查是否为SSL套接字（更准确的检测方法）
+    if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
+        # SSL/TLS套接字
+        sock.send(req)
+        data = sock.recv(2000)
+    else:
+        # UDP套接字
+        sock.sendto(req, server_address)
+        data, _ = sock.recvfrom(2000)
+    
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] CreatePermission response:", attrs)
     
@@ -883,9 +894,17 @@ def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_
     ]
     
     req = build_msg(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
-    sock.sendto(req, server_address)
     
-    data, _ = sock.recvfrom(2000)
+    # 检查是否为SSL套接字（更准确的检测方法）
+    if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
+        # SSL/TLS套接字
+        sock.send(req)
+        data = sock.recv(2000)
+    else:
+        # UDP套接字
+        sock.sendto(req, server_address)
+        data, _ = sock.recvfrom(2000)
+    
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] ChannelBind response:", attrs)
     
@@ -946,6 +965,7 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
     tid = gen_tid()
     # 使用传入的用户名或默认值
     auth_username = username or USERNAME
+    print(f"[+] Using username for Connect request: {auth_username}")
     
     attrs = [
         stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
@@ -1124,6 +1144,7 @@ def main_tcp_udp(target_ip, target_port, turn_server=None, turn_port=None, usern
     print("[+] TCP+UDP TURN client demo completed successfully")
     control_sock.close()
 
+
 def main_tcp(target_ip, target_port, turn_server=None, turn_port=None, username=None, password=None, realm=None, use_tls=False):
     """主函数：演示TCP TURN客户端功能"""
     print("[+] Starting TCP TURN client...")
@@ -1155,92 +1176,50 @@ def main_tcp(target_ip, target_port, turn_server=None, turn_port=None, username=
         control_sock.close()
         return
     
-    # 4. 建立数据连接
-    # 注意：在实际应用中，这里需要建立一个新的TCP连接到TURN服务器
-    # 作为数据连接，然后使用ConnectionBind绑定到对等方连接
-    print("[+] TCP connection initiated successfully")
-    print("[+] Note: In a real implementation, you would need to:")
-    print("    1. Establish a new TCP connection to TURN server as data connection")
-    print("    2. Send ConnectionBind request on the data connection")
-    print("    3. Use the data connection for actual data transfer")
+    # 4. 建立数据连接（RFC6062要求）
+    print("[+] Establishing data connection to TURN server...")
+    data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    data_sock.settimeout(10)
     
-    # 5. 发送测试数据（这里只是演示，实际需要数据连接）
-    test_data = b"Hello from TCP TURN client!"
-    print(f"[+] Would send TCP data: {test_data}")
-    
-    print("[+] TCP TURN client demo completed successfully")
-    
-    # 关闭控制连接
-    control_sock.close()
-
-def demo_tcp_with_data_connection(target_ip, target_port, turn_server=None, turn_port=None, username=None, password=None, realm=None, use_tls=False):
-    """演示完整的TCP TURN流程，包括数据连接"""
-    print("[+] Starting complete TCP TURN demo...")
-    
-    # 解析TURN服务器地址
-    if turn_server:
-        server_address = resolve_server_address(turn_server, turn_port or DEFAULT_TURN_PORT)
-        if not server_address:
-            print("[-] Failed to resolve TURN server address")
-            return
-    else:
-        server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
-    
-    print(f"[+] Using TURN server: {server_address}")
-    
-    # 1. 分配TCP TURN中继地址
-    result = allocate_tcp(server_address, username, password, realm, use_tls, turn_server)
-    if not result:
-        print("[-] Failed to allocate TCP TURN relay")
-        return
-    
-    control_sock, nonce, realm, integrity_key, actual_server_address = result
-    print("[+] TCP TURN allocation successful")
-    
-    # 3. 发起TCP连接到对等方
-    connection_id = tcp_connect(control_sock, nonce, realm, integrity_key, target_ip, target_port, username)
-    if not connection_id:
-        print("[-] Failed to initiate TCP connection")
-        control_sock.close()
-        return
-    
-    # 4. 建立数据连接
     try:
-        data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        data_sock.settimeout(10)
-        data_sock.connect(server_address)
-        print("[+] Data connection established")
+        # 建立新的TCP连接到TURN服务器作为数据连接
+        data_sock.connect(actual_server_address)
+        print(f"[+] Data connection established to {actual_server_address}")
         
-        # 5. 绑定数据连接到对等方连接
-        if not tcp_connection_bind(data_sock, nonce, realm, integrity_key, connection_id, server_address, username):
+        # 在数据连接上发送ConnectionBind请求
+        if not tcp_connection_bind(data_sock, nonce, realm, integrity_key, connection_id, actual_server_address, username):
             print("[-] Failed to bind data connection")
             data_sock.close()
             control_sock.close()
             return
         
-        # 6. 发送测试数据
-        #test_data = b"Hello from TCP TURN client with data connection!"
-        test_data = b"GET / HTTP/1.1\r\nHost: 52.71.132.100\r\n\r\n"
-        if not tcp_send_data(data_sock, test_data):
-            print("[-] Failed to send TCP data")
-            data_sock.close()
-            control_sock.close()
-            return
+        print("[+] Data connection bound successfully")
         
-        # 7. 尝试接收数据
-        received_data = tcp_receive_data(data_sock)
-        if received_data:
-            print(f"[+] Received response: {received_data}")
+        # 5. 发送测试数据
+        test_data = b"Hello from TCP TURN client!"
+        print(f"[+] Sending TCP data: {test_data}")
+        data_sock.send(test_data)
         
-        print("[+] Complete TCP TURN demo completed successfully")
+        # 6. 接收响应数据
+        print("[+] Waiting for response...")
+        try:
+            response = data_sock.recv(1024)
+            if response:
+                print(f"[+] Received response: {response}")
+            else:
+                print("[+] Connection closed by peer")
+        except socket.timeout:
+            print("[+] No response received (timeout)")
+        
+        print("[+] TCP TURN client demo completed successfully")
         
     except Exception as e:
-        print(f"[-] Data connection failed: {e}")
+        print(f"[-] Failed to establish data connection: {e}")
     finally:
-        # 清理资源
-        if 'data_sock' in locals():
-            data_sock.close()
+        # 关闭连接
+        data_sock.close()
         control_sock.close()
+
     
 
 def test():
@@ -1265,8 +1244,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='TURN客户端实现 - 支持UDP和TCP传输协议')
-    parser.add_argument('mode', nargs='?', choices=['udp', 'tcp', 'tcp-full', 'tcp-udp'], default='udp',
-                       help='运行模式: udp (UDP TURN), tcp (基本TCP TURN), tcp-full (完整TCP TURN), tcp-udp (TCP连接+UDP中继)')
+    parser.add_argument('mode', nargs='?', choices=['udp', 'tcp-udp', 'tcp'], default='udp',
+                       help='运行模式: udp (UDP TURN), tcp-udp (TCP连接+UDP中继), tcp (TCP TURN)')
     parser.add_argument('--target-ip', required=True, help='目标IP地址')
     parser.add_argument('--target-port', type=int, required=True, help='目标端口')
     parser.add_argument('--turn-server', help='TURN服务器地址（域名或IP）')
@@ -1287,10 +1266,8 @@ if __name__ == "__main__":
     
     if args.mode == "udp":
         main(args.target_ip, args.target_port, args.turn_server, args.turn_port, args.username, args.password, args.realm)
-    elif args.mode == "tcp":
-        main_tcp(args.target_ip, args.target_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, args.tls)
-    elif args.mode == "tcp-full":
-        demo_tcp_with_data_connection(args.target_ip, args.target_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, args.tls)
     elif args.mode == "tcp-udp":
         main_tcp_udp(args.target_ip, args.target_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, args.tls)
+    elif args.mode == "tcp":
+        main_tcp(args.target_ip, args.target_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, args.tls)
     
