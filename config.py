@@ -10,7 +10,7 @@ DEFAULT_TURN_PORT = 3478
 
 # TURN认证信息
 USERNAME = "demo"
-PASSWORD = "demoPass123"
+PASSWORD = "xxx"
 REALM = "anjhz3.com"
 
 # 其他配置
