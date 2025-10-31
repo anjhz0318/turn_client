@@ -255,8 +255,10 @@ class HTTPTURNClient:
                 try:
                     chunk = self.data_sock.recv(4096)
                     if not chunk:
+                        print("[!] Connection closed by server (received empty chunk)")
                         break
                     response_data += chunk
+                    print(f"[+] Received {len(chunk)} bytes (total: {len(response_data)} bytes)")
                     
                     # 检查是否收到完整的响应头
                     if b"\r\n\r\n" in response_data:
@@ -279,7 +281,25 @@ class HTTPTURNClient:
             
             if not header_complete:
                 print("[-] Incomplete response headers")
-                return response_data
+                if response_data:
+                    print(f"[+] Received {len(response_data)} bytes (partial data):")
+                    try:
+                        # 尝试以文本形式显示
+                        text_data = response_data.decode('utf-8', errors='replace')
+                        print("=" * 60)
+                        print(text_data)
+                        print("=" * 60)
+                        # 也显示原始字节（如果有特殊字符）
+                        if len(response_data) <= 100:
+                            print(f"[+] Raw bytes (hex): {response_data.hex()}")
+                    except:
+                        # 如果无法解码，显示十六进制
+                        print("=" * 60)
+                        print(f"Raw bytes (hex): {response_data.hex()}")
+                        print("=" * 60)
+                else:
+                    print("[!] No data received - server may not be responding")
+                return response_data if response_data else None
             
             # 计算已接收的响应体长度
             header_end = response_data.find(b"\r\n\r\n") + 4
@@ -318,7 +338,10 @@ class HTTPTURNClient:
             
         except Exception as e:
             print(f"[-] Error receiving response: {e}")
-            return None
+            # 即使出错，也返回已接收的数据
+            if response_data:
+                print(f"[+] Returning {len(response_data)} bytes already received")
+            return response_data if response_data else None
     
     def get_ssl_info(self):
         """获取SSL连接信息"""
@@ -520,14 +543,27 @@ def main():
     custom_request = None
     if args.custom_request:
         custom_request = args.custom_request
+        # 将字面量 \r\n 转换为实际换行符
+        custom_request = custom_request.replace('\\r\\n', '\r\n').replace('\\n', '\n')
+        # 确保使用 CRLF 格式
+        custom_request = custom_request.replace('\n', '\r\n').replace('\r\r\n', '\r\n')
     elif args.request_file:
         try:
             with open(args.request_file, 'r', encoding='utf-8') as f:
                 custom_request = f.read()
+            # 将 LF (\n) 转换为 CRLF (\r\n) 以确保HTTP格式正确
+            if custom_request and '\r\n' not in custom_request:
+                custom_request = custom_request.replace('\n', '\r\n')
             print(f"[+] Loaded custom request from {args.request_file}")
         except Exception as e:
             print(f"[-] Failed to read request file: {e}")
             return 1
+    
+    # 如果是自定义请求，也需要确保格式正确（处理可能的 LF）
+    if custom_request:
+        # 只处理没有 CRLF 的情况
+        if '\r\n' not in custom_request and '\n' in custom_request:
+            custom_request = custom_request.replace('\n', '\r\n')
     
     # 设置默认端口
     if args.https and args.target_port == 80:

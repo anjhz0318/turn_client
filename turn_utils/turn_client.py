@@ -695,7 +695,20 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
         if msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
             # 检查错误代码
             error_code = attrs.get(9)
-            if error_code and b"Unauthorized" in error_code:
+            # 检查是否是401 Unauthorized错误
+            is_unauthorized = False
+            if error_code:
+                # 检查错误代码格式: 前2字节是错误类，第3字节是错误号
+                if len(error_code) >= 4:
+                    error_class = error_code[2]
+                    error_number = error_code[3]
+                    if error_class == 4 and error_number == 1:  # 401 Unauthorized
+                        is_unauthorized = True
+                # 也检查文本形式的错误
+                if b"Unauthorized" in error_code or b"401" in error_code:
+                    is_unauthorized = True
+            
+            if is_unauthorized:
                 print("[+] Got nonce and realm for authentication")
                 nonce = attrs.get(21)
                 server_realm = attrs.get(20)
@@ -733,9 +746,17 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
                     elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
                         error_code = attrs.get(9)
                         if error_code:
-                            error_text = error_code[3:].decode('utf-8', errors='ignore')
-                            print(f"[-] TCP+UDP TURN allocation failed: Error response")
-                            print(f"[-] Error: {error_text}")
+                            # 解析错误代码
+                            if len(error_code) >= 4:
+                                error_class = error_code[2]
+                                error_number = error_code[3]
+                                error_text = error_code[4:].decode('utf-8', errors='ignore')
+                                print(f"[-] TCP+UDP TURN allocation failed: Error response")
+                                print(f"[-] Error: {error_class}{error_number:02d} {error_text}")
+                            else:
+                                error_text = error_code[3:].decode('utf-8', errors='ignore')
+                                print(f"[-] TCP+UDP TURN allocation failed: Error response")
+                                print(f"[-] Error: {error_text}")
                         control_sock.close()
                         return None
                     else:
@@ -857,6 +878,15 @@ def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, ser
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] CreatePermission response:", attrs)
     
+    # 检查是否有错误响应
+    if msg_type == STUN_CREATE_PERMISSION_ERROR_RESPONSE:
+        error_code = attrs.get(9)  # STUN_ATTR_ERROR_CODE
+        if error_code:
+            error_code_int = struct.unpack("!H", error_code[:2])[0]
+            error_reason = error_code[4:].decode('utf-8', errors='ignore')
+            print(f"[-] CreatePermission failed: {error_code_int} {error_reason}")
+            return False
+    
     return True
 
 def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, server_address=None, username=None):
@@ -907,6 +937,15 @@ def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_
     
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] ChannelBind response:", attrs)
+    
+    # 检查是否有错误响应
+    if msg_type == STUN_CHANNEL_BIND_ERROR_RESPONSE:
+        error_code = attrs.get(9)  # STUN_ATTR_ERROR_CODE
+        if error_code:
+            error_code_int = struct.unpack("!H", error_code[:2])[0]
+            error_reason = error_code[4:].decode('utf-8', errors='ignore')
+            print(f"[-] ChannelBind failed: {error_code_int} {error_reason}")
+            return False
     
     return True
 
@@ -982,14 +1021,35 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] Connect response:", attrs)
     
-    # 检查是否包含CONNECTION-ID属性
-    connection_id = attrs.get(STUN_ATTR_CONNECTION_ID)
-    if connection_id:
-        conn_id = struct.unpack("!I", connection_id)[0]
-        print(f"[+] Got connection ID: {conn_id}")
-        return conn_id
+    # 检查响应类型
+    if msg_type == 0x010a:  # Connect Success Response (0x010a)
+        print("[+] Connect successful")
+        connection_id = attrs.get(STUN_ATTR_CONNECTION_ID)
+        if connection_id:
+            conn_id = struct.unpack("!I", connection_id)[0]
+            print(f"[+] Got connection ID: {conn_id}")
+            return conn_id
+        else:
+            print("[-] No connection ID in Connect response")
+            print("[-] Response attributes keys:", list(attrs.keys()))
+            return None
+    elif msg_type == 0x011a:  # Connect Error Response (0x011a)
+        print("[-] Connect error")
+        error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+        if error_code:
+            if len(error_code) >= 4:
+                error_class = error_code[2]
+                error_number = error_code[3]
+                error_text = error_code[4:].decode('utf-8', errors='ignore')
+                print(f"[-] Error: {error_class}{error_number:02d} {error_text}")
+            else:
+                error_text = error_code.decode('utf-8', errors='ignore')
+                print(f"[-] Error: {error_text}")
+        print("[-] Response attributes keys:", list(attrs.keys()))
+        return None
     else:
-        print("[-] No connection ID in Connect response")
+        print(f"[-] Unexpected response type: 0x{msg_type:04x}")
+        print("[-] Response attributes keys:", list(attrs.keys()))
         return None
 
 def tcp_connection_bind(control_sock, nonce, realm, integrity_key, connection_id, server_address=None, username=None):
