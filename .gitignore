@@ -1,4 +1,19 @@
-# 只忽略Python缓存文件
+# Python 缓存文件
 __pycache__/
 *.py[cod]
 *$py.class
+
+# 日志文件
+*.log
+scanner_*.log
+
+# 进度和结果文件（包含敏感信息）
+webrtc_scanner/webrtc_scan_progress.json
+webrtc_scanner/webrtc_scan_results.json
+
+# 大型数据文件
+tranco_top_1m_domains/
+
+# PID 文件
+*.pid
+scanner.pid
