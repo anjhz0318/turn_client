@@ -1,0 +1,14 @@
+# WebRTC 域名扫描器和 TURN 服务器测试工具依赖
+
+# HTTP 请求库
+requests>=2.31.0
+
+# DNS 解析库（用于 TURN 服务器发现）
+dnspython>=2.4.0
+
+# 字符编码检测库（可选，但推荐用于更好的编码处理）
+chardet>=5.2.0
+
+# urllib3 通常随 requests 一起安装，但明确列出以确保版本兼容性
+urllib3>=2.0.0
+

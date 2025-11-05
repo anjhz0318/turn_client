@@ -27,6 +27,7 @@ import zlib
 import dns.resolver
 import dns.exception
 import time
+import unicodedata
 
 # === 配置 ===
 # 从配置文件导入TURN服务器配置
@@ -59,9 +60,13 @@ STUN_CHANNEL_BIND_ERROR_RESPONSE = 0x0119
 # STUN 属性类型
 STUN_ATTR_USERNAME = 0x0006
 STUN_ATTR_MESSAGE_INTEGRITY = 0x0008
+STUN_ATTR_MESSAGE_INTEGRITY_SHA256 = 0x001c
 STUN_ATTR_REALM = 0x0014
 STUN_ATTR_NONCE = 0x0015
 STUN_ATTR_REQUESTED_TRANSPORT = 0x0019
+STUN_ATTR_PASSWORD_ALGORITHMS = 0x8002
+STUN_ATTR_PASSWORD_ALGORITHM = 0x8001
+STUN_ATTR_USERHASH = 0x001f
 STUN_ATTR_XOR_PEER_ADDRESS = 0x0012
 STUN_ATTR_CHANNEL_NUMBER = 0x000C
 STUN_ATTR_FINGERPRINT = 0x8028
@@ -201,6 +206,315 @@ def stun_attr(attr_type, value):
     pad_len = (4 - (len(value) % 4)) % 4
     return struct.pack("!HH", attr_type, len(value)) + value + b"\x00" * pad_len
 
+def opaque_string(s):
+    """处理 OpaqueString profile (RFC 8265)
+    
+    根据 RFC 8265，OpaqueString profile 用于处理密码：
+    1. 确保字符串只包含 FreeformClass 允许的 Unicode 代码点
+    2. 非 ASCII 空格映射到 SPACE (U+0020)
+    3. 应用 Unicode Normalization Form C (NFC)
+    4. 不允许控制字符（除了 SPACE）
+    
+    Args:
+        s: 输入字符串或字节
+        
+    Returns:
+        UTF-8 编码的字节串，符合 OpaqueString profile
+    """
+    if isinstance(s, bytes):
+        # 如果已经是字节，去除尾随 null 字节
+        s = s.rstrip(b'\x00')
+        # 尝试解码为字符串，然后重新编码
+        try:
+            s = s.decode('utf-8')
+        except UnicodeDecodeError:
+            # 如果无法解码，直接使用原始字节（去除尾随 null 后）
+            return s
+    else:
+        # 如果是字符串，去除尾随 null 字符
+        s = s.rstrip('\x00')
+    
+    # 空字符串检查
+    if not s:
+        raise ValueError("OpaqueString cannot be zero-length")
+    
+    # 1. 非 ASCII 空格映射到 SPACE (U+0020)
+    # 查找所有 Unicode 类别为 "Zs"（空格分隔符）但不是 U+0020 的字符
+    normalized = []
+    for char in s:
+        if unicodedata.category(char) == 'Zs' and ord(char) != 0x0020:
+            normalized.append(' ')  # 映射到 SPACE (U+0020)
+        else:
+            normalized.append(char)
+    s = ''.join(normalized)
+    
+    # 2. 检查控制字符（不允许控制字符，除了 SPACE）
+    # 控制字符的 Unicode 类别是 "Cc"（除了 SPACE 本身就是控制字符）
+    # 但 SPACE (U+0020) 是允许的
+    # 实际上，根据 RFC 8265，只允许 SPACE (U+0020)，不允许其他控制字符
+    filtered = []
+    for char in s:
+        if ord(char) == 0x0020:  # SPACE 是允许的
+            filtered.append(char)
+        elif unicodedata.category(char).startswith('C'):  # 控制字符类别
+            # 不允许控制字符（除了 SPACE）
+            raise ValueError(f"Control character U+{ord(char):04X} is not allowed in OpaqueString")
+        else:
+            filtered.append(char)
+    s = ''.join(filtered)
+    
+    # 3. 应用 Unicode Normalization Form C (NFC)
+    s = unicodedata.normalize('NFC', s)
+    
+    # 4. 使用 UTF-8 编码
+    return s.encode('utf-8')
+
+def compute_long_term_hmac_key(username, realm, password):
+    """计算长期凭据的 HMAC Key (RFC 8489 Section 9.2.2)
+    
+    key = MD5(username ":" OpaqueString(realm) ":" OpaqueString(password))
+    
+    Args:
+        username: 用户名（字符串）
+        realm: REALM（字节串）
+        password: 密码（字符串）
+        
+    Returns:
+        16字节的HMAC key
+    """
+    # 处理 realm：如果是字节串，先解码
+    if isinstance(realm, bytes):
+        realm_str = realm.decode('utf-8', errors='ignore')
+    else:
+        realm_str = str(realm)
+    
+    # 使用 OpaqueString 处理 realm 和 password
+    realm_opaque = opaque_string(realm_str).decode('utf-8')
+    password_opaque = opaque_string(password).decode('utf-8')
+    
+    # 拼接：username:realm:password
+    key_str = f"{username}:{realm_opaque}:{password_opaque}"
+    
+    # 计算 MD5
+    return hashlib.md5(key_str.encode('utf-8')).digest()
+
+def check_nonce_cookie(nonce):
+    """检查 nonce 是否以 nonce cookie 开头 (RFC 8489 Section 9.2)
+    
+    nonce cookie = "obMatJos2" + base64(24-bit STUN Security Features)
+    
+    Args:
+        nonce: NONCE 属性值（字节串）
+        
+    Returns:
+        (has_cookie, security_features_bits) 或 (False, None)
+    """
+    if not nonce or len(nonce) < 13:
+        return False, None
+    
+    cookie_prefix = b"obMatJos2"
+    if not nonce.startswith(cookie_prefix):
+        return False, None
+    
+    # 提取 Security Features（3字节，base64编码）
+    if len(nonce) < 13:
+        return False, None
+    
+    try:
+        # 提取 base64 编码的 Security Features（4个字符）
+        import base64
+        features_b64 = nonce[9:13].decode('ascii')
+        features_bytes = base64.b64decode(features_b64 + '==')  # 添加填充以确保正确解码
+        if len(features_bytes) >= 3:
+            # 提取前3个字节（24位）
+            features = features_bytes[:3]
+            return True, features
+    except:
+        pass
+    
+    return True, None  # 有 cookie 但无法解析 features
+
+def parse_password_algorithms(attr_value):
+    """解析 PASSWORD-ALGORITHMS 属性 (RFC 8489 Section 14.11)
+    
+    Args:
+        attr_value: PASSWORD-ALGORITHMS 属性值（字节串）
+        
+    Returns:
+        算法列表，每个元素是 (algorithm_id, parameters)
+    """
+    algorithms = []
+    if len(attr_value) < 2:
+        return algorithms
+    
+    # PASSWORD-ALGORITHMS 格式：每个算法占2字节（算法ID）
+    # 但实际上每个算法可能包含参数，格式更复杂
+    # 简化实现：假设每个算法2字节
+    i = 0
+    while i + 2 <= len(attr_value):
+        alg_id = struct.unpack("!H", attr_value[i:i+2])[0]
+        algorithms.append(alg_id)
+        i += 2
+    
+    return algorithms
+
+def verify_short_term_response_integrity(data, integrity_key, expected_algorithm=None):
+    """验证短期凭据响应的消息完整性 (RFC 8489 Section 9.1.4)
+    
+    Args:
+        data: 原始响应数据（字节串）
+        integrity_key: HMAC密钥（OpaqueString(password)）
+        expected_algorithm: 期望的算法 ('sha256', 'sha1', 'both', None)
+        
+    Returns:
+        (is_valid, algorithm_used) 或 (False, None)
+    """
+    try:
+        msg_type, tid, attrs = parse_attrs(data)
+        
+        # 检查响应中是否包含消息完整性属性
+        has_sha256 = STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in attrs
+        has_sha1 = STUN_ATTR_MESSAGE_INTEGRITY in attrs
+        
+        # 根据 RFC 8489 Section 9.1.4，如果客户端只发送了一个算法，响应必须匹配
+        if expected_algorithm == 'sha256':
+            if not has_sha256:
+                print("[!] Response does not contain MESSAGE-INTEGRITY-SHA256 as expected")
+                return False, None
+        elif expected_algorithm == 'sha1':
+            if not has_sha1:
+                print("[!] Response does not contain MESSAGE-INTEGRITY as expected")
+                return False, None
+        
+        # 如果两者都不存在，返回 False
+        if not has_sha256 and not has_sha1:
+            return False, None
+        
+        # 验证消息完整性
+        if has_sha256:
+            # 验证 MESSAGE-INTEGRITY-SHA256 (RFC 8489 Section 14.6)
+            # 找到 MESSAGE-INTEGRITY-SHA256 属性的位置
+            pos = 20  # 跳过 header
+            msg_len = struct.unpack("!H", data[2:4])[0]
+            mi_sha256_pos = None
+            mi_sha256_value = None
+            mi_sha256_len = None
+            
+            # 解析消息找到 MESSAGE-INTEGRITY-SHA256 属性
+            current_pos = 20
+            while current_pos < 20 + msg_len:
+                atype, alen = struct.unpack("!HH", data[current_pos:current_pos+4])
+                if atype == STUN_ATTR_MESSAGE_INTEGRITY_SHA256:
+                    mi_sha256_pos = current_pos
+                    mi_sha256_len = alen
+                    mi_sha256_value = data[current_pos+4:current_pos+4+alen]
+                    break
+                current_pos += 4 + ((alen + 3) // 4) * 4
+            
+            if mi_sha256_pos is None:
+                return False, None
+            
+            # 构建用于 HMAC 计算的消息（到 MESSAGE-INTEGRITY-SHA256 之前）
+            # Header length 字段指向 MESSAGE-INTEGRITY-SHA256 的末尾
+            # 但 HMAC 计算只包含到 MESSAGE-INTEGRITY-SHA256 之前的属性
+            body_before_mi = data[20:mi_sha256_pos]
+            
+            # 重新构建 header，length 指向 MESSAGE-INTEGRITY-SHA256 的末尾（不包括 FINGERPRINT）
+            # 根据 RFC 8489 Section 14.6，length 字段必须调整为指向 MESSAGE-INTEGRITY-SHA256 的末尾
+            length_for_hmac = mi_sha256_pos + 4 + mi_sha256_len - 20
+            
+            # 重新构建 header
+            header = struct.pack("!HHI12s", msg_type, length_for_hmac, struct.unpack("!I", data[4:8])[0], tid)
+            
+            # 计算 HMAC-SHA256
+            msg_for_hmac = header + body_before_mi
+            computed_hmac = hmac.new(integrity_key, msg_for_hmac, hashlib.sha256).digest()
+            
+            # 比较（响应中的值可能被截断到至少16字节）
+            if len(mi_sha256_value) >= 16:
+                if computed_hmac[:len(mi_sha256_value)] == mi_sha256_value:
+                    return True, 'sha256'
+                else:
+                    print("[!] MESSAGE-INTEGRITY-SHA256 verification failed")
+                    return False, None
+            else:
+                return False, None
+                
+        elif has_sha1:
+            # 验证 MESSAGE-INTEGRITY (RFC 8489 Section 14.5)
+            # 找到 MESSAGE-INTEGRITY 属性的位置
+            pos = 20
+            msg_len = struct.unpack("!H", data[2:4])[0]
+            mi_pos = None
+            mi_value = None
+            mi_len = None
+            
+            current_pos = 20
+            while current_pos < 20 + msg_len:
+                atype, alen = struct.unpack("!HH", data[current_pos:current_pos+4])
+                if atype == STUN_ATTR_MESSAGE_INTEGRITY:
+                    mi_pos = current_pos
+                    mi_len = alen
+                    mi_value = data[current_pos+4:current_pos+4+alen]
+                    break
+                current_pos += 4 + ((alen + 3) // 4) * 4
+            
+            if mi_pos is None:
+                return False, None
+            
+            # 构建用于 HMAC 计算的消息
+            # 根据 RFC 8489 Section 14.5，如果存在 MESSAGE-INTEGRITY-SHA256，HMAC 计算包含它
+            if has_sha256:
+                # 找到 MESSAGE-INTEGRITY-SHA256 的位置
+                mi_sha256_pos = None
+                mi_sha256_len = None
+                current_pos = 20
+                while current_pos < 20 + msg_len:
+                    atype, alen = struct.unpack("!HH", data[current_pos:current_pos+4])
+                    if atype == STUN_ATTR_MESSAGE_INTEGRITY_SHA256:
+                        mi_sha256_pos = current_pos
+                        mi_sha256_len = alen
+                        break
+                    current_pos += 4 + ((alen + 3) // 4) * 4
+                
+                if mi_sha256_pos and mi_sha256_pos < mi_pos:
+                    # MESSAGE-INTEGRITY-SHA256 在 MESSAGE-INTEGRITY 之前
+                    # HMAC 计算包含到 MESSAGE-INTEGRITY-SHA256 的末尾（包括 MESSAGE-INTEGRITY-SHA256）
+                    body_before_mi = data[20:mi_sha256_pos + 4 + mi_sha256_len]
+                    # Length 指向 MESSAGE-INTEGRITY 的末尾
+                    length_for_hmac = mi_pos + 4 + mi_len - 20
+                else:
+                    body_before_mi = data[20:mi_pos]
+                    length_for_hmac = mi_pos + 4 + mi_len - 20
+            else:
+                body_before_mi = data[20:mi_pos]
+                length_for_hmac = mi_pos + 4 + mi_len - 20
+            
+            # 根据 RFC 8489 Section 14.5，length 字段必须调整为指向 MESSAGE-INTEGRITY 的末尾
+            # FINGERPRINT 在 MESSAGE-INTEGRITY 之后，不影响 HMAC 计算
+            
+            # 重新构建 header
+            header = struct.pack("!HHI12s", msg_type, length_for_hmac, struct.unpack("!I", data[4:8])[0], tid)
+            
+            # 计算 HMAC-SHA1
+            msg_for_hmac = header + body_before_mi
+            computed_hmac = hmac.new(integrity_key, msg_for_hmac, hashlib.sha1).digest()
+            
+            # 比较
+            if computed_hmac == mi_value:
+                return True, 'sha1'
+            else:
+                print("[!] MESSAGE-INTEGRITY verification failed")
+                return False, None
+        
+        return False, None
+            
+    except Exception as e:
+        print(f"[!] Error verifying response integrity: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, None
+
 def build_msg(msg_type, tid, attrs, integrity_key=None, add_fingerprint=False):
     
     body = b"".join(attrs)
@@ -258,6 +572,230 @@ def build_msg(msg_type, tid, attrs, integrity_key=None, add_fingerprint=False):
     return msg
 
 
+def build_msg_with_short_term_credential(msg_type, tid, attrs, integrity_key, add_fingerprint=False):
+    """构建包含短期凭证认证的STUN消息（RFC 8489）
+    
+    根据 RFC 8489 第 9.1.2 节，短期凭证必须同时包含：
+    1. USERNAME
+    2. MESSAGE-INTEGRITY-SHA256
+    3. MESSAGE-INTEGRITY
+    
+    属性顺序：USERNAME -> MESSAGE-INTEGRITY-SHA256 -> MESSAGE-INTEGRITY -> FINGERPRINT
+    
+    Args:
+        msg_type: 消息类型
+        tid: 事务ID
+        attrs: 属性列表（不包含认证相关属性）
+        integrity_key: HMAC密钥（OpaqueString(password)）
+        add_fingerprint: 是否添加FINGERPRINT属性
+    
+    Returns:
+        构建好的STUN消息（字节串）
+    """
+    body = b"".join(attrs)
+    
+    # 创建占位符
+    mi_sha256_dummy = b"\x00" * 32  # MESSAGE-INTEGRITY-SHA256 占位符（32字节）
+    mi_dummy = b"\x00" * 20  # MESSAGE-INTEGRITY 占位符（20字节）
+    
+    # 构建带占位符的消息体
+    mi_sha256_attr_dummy = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY_SHA256, len(mi_sha256_dummy)) + mi_sha256_dummy
+    mi_attr_dummy = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY, len(mi_dummy)) + mi_dummy
+    
+    body_with_mi_sha256_dummy = body + mi_sha256_attr_dummy
+    body_with_both_mi_dummy = body_with_mi_sha256_dummy + mi_attr_dummy
+    
+    # 如果使用FINGERPRINT，添加占位符
+    fp_attr_dummy = None
+    if add_fingerprint:
+        fp_attr_dummy = struct.pack("!HHI", STUN_ATTR_FINGERPRINT, 4, 0)
+        body_with_all_dummy = body_with_both_mi_dummy + fp_attr_dummy
+    else:
+        body_with_all_dummy = body_with_both_mi_dummy
+    
+    # 计算 MESSAGE-INTEGRITY-SHA256
+    # 输入：header + body（到 MESSAGE-INTEGRITY-SHA256 之前的属性）
+    # Length 字段指向 MESSAGE-INTEGRITY-SHA256 的末尾（如果使用FINGERPRINT，长度也应包含FINGERPRINT dummy）
+    if add_fingerprint:
+        body_with_mi_sha256_dummy_and_fp_dummy = body_with_mi_sha256_dummy + fp_attr_dummy
+        header_for_sha256 = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_dummy_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+    else:
+        header_for_sha256 = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_dummy), STUN_MAGIC_COOKIE, tid)
+    msg_for_sha256 = header_for_sha256 + body  # HMAC计算时不包含FINGERPRINT dummy
+    
+    # 计算 HMAC-SHA256
+    hmac_sha256_val = hmac.new(integrity_key, msg_for_sha256, hashlib.sha256).digest()
+    
+    # 替换 MESSAGE-INTEGRITY-SHA256 占位符
+    mi_sha256_attr = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY_SHA256, len(hmac_sha256_val)) + hmac_sha256_val
+    body_with_mi_sha256 = body + mi_sha256_attr
+    
+    # 计算 MESSAGE-INTEGRITY
+    # 输入：header + body（到 MESSAGE-INTEGRITY 之前的属性，即包含 MESSAGE-INTEGRITY-SHA256）
+    # Length 字段指向 MESSAGE-INTEGRITY 的末尾（如果使用FINGERPRINT，长度也应包含FINGERPRINT dummy）
+    body_with_mi_sha256_and_mi_dummy = body_with_mi_sha256 + mi_attr_dummy
+    if add_fingerprint:
+        body_with_mi_sha256_and_mi_dummy_and_fp_dummy = body_with_mi_sha256_and_mi_dummy + fp_attr_dummy
+        header_for_sha1 = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_and_mi_dummy_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+    else:
+        header_for_sha1 = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_and_mi_dummy), STUN_MAGIC_COOKIE, tid)
+    msg_for_sha1 = header_for_sha1 + body_with_mi_sha256  # HMAC计算时不包含FINGERPRINT dummy
+    
+    # 计算 HMAC-SHA1
+    hmac_sha1_val = hmac.new(integrity_key, msg_for_sha1, hashlib.sha1).digest()
+    
+    # 替换 MESSAGE-INTEGRITY 占位符
+    mi_attr = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY, len(hmac_sha1_val)) + hmac_sha1_val
+    body_with_both_mi = body_with_mi_sha256 + mi_attr
+    
+    # 如果使用FINGERPRINT，计算并添加
+    if add_fingerprint:
+        body_with_both_mi_and_fp_dummy = body_with_both_mi + fp_attr_dummy
+        header_for_fp = struct.pack("!HHI12s", msg_type, len(body_with_both_mi_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+        
+        # 计算CRC32（不包含FINGERPRINT）
+        msg_for_crc = header_for_fp + body_with_both_mi
+        crc32_val = zlib.crc32(msg_for_crc) & 0xffffffff
+        fingerprint_val = crc32_val ^ 0x5354554e
+        
+        # 替换FINGERPRINT占位符
+        fp_attr = struct.pack("!HHI", STUN_ATTR_FINGERPRINT, 4, fingerprint_val)
+        body_with_all = body_with_both_mi + fp_attr
+        header = struct.pack("!HHI12s", msg_type, len(body_with_all), STUN_MAGIC_COOKIE, tid)
+        msg = header + body_with_all
+    else:
+        header = struct.pack("!HHI12s", msg_type, len(body_with_both_mi), STUN_MAGIC_COOKIE, tid)
+        msg = header + body_with_both_mi
+    
+    return msg
+
+
+def build_msg_with_short_term_credential_sha256_only(msg_type, tid, attrs, integrity_key, add_fingerprint=False):
+    """构建包含短期凭证认证的STUN消息（仅使用MESSAGE-INTEGRITY-SHA256）
+    
+    属性顺序：USERNAME -> MESSAGE-INTEGRITY-SHA256 -> FINGERPRINT
+    
+    Args:
+        msg_type: 消息类型
+        tid: 事务ID
+        attrs: 属性列表（不包含认证相关属性）
+        integrity_key: HMAC密钥（OpaqueString(password)）
+        add_fingerprint: 是否添加FINGERPRINT属性
+    
+    Returns:
+        构建好的STUN消息（字节串）
+    """
+    body = b"".join(attrs)
+    
+    # 创建占位符
+    mi_sha256_dummy = b"\x00" * 32  # MESSAGE-INTEGRITY-SHA256 占位符（32字节）
+    
+    # 构建带占位符的消息体
+    mi_sha256_attr_dummy = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY_SHA256, len(mi_sha256_dummy)) + mi_sha256_dummy
+    body_with_mi_sha256_dummy = body + mi_sha256_attr_dummy
+    
+    # 如果使用FINGERPRINT，添加占位符
+    fp_attr_dummy = None
+    if add_fingerprint:
+        fp_attr_dummy = struct.pack("!HHI", STUN_ATTR_FINGERPRINT, 4, 0)
+        body_with_mi_sha256_dummy_and_fp_dummy = body_with_mi_sha256_dummy + fp_attr_dummy
+        header_for_sha256 = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_dummy_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+    else:
+        header_for_sha256 = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_dummy), STUN_MAGIC_COOKIE, tid)
+    msg_for_sha256 = header_for_sha256 + body  # HMAC计算时不包含FINGERPRINT dummy
+    
+    # 计算 HMAC-SHA256
+    hmac_sha256_val = hmac.new(integrity_key, msg_for_sha256, hashlib.sha256).digest()
+    
+    # 替换 MESSAGE-INTEGRITY-SHA256 占位符
+    mi_sha256_attr = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY_SHA256, len(hmac_sha256_val)) + hmac_sha256_val
+    body_with_mi_sha256 = body + mi_sha256_attr
+    
+    # 如果使用FINGERPRINT，计算并添加
+    if add_fingerprint:
+        body_with_mi_sha256_and_fp_dummy = body_with_mi_sha256 + fp_attr_dummy
+        header_for_fp = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+        
+        # 计算CRC32（不包含FINGERPRINT）
+        msg_for_crc = header_for_fp + body_with_mi_sha256
+        crc32_val = zlib.crc32(msg_for_crc) & 0xffffffff
+        fingerprint_val = crc32_val ^ 0x5354554e
+        
+        # 替换FINGERPRINT占位符
+        fp_attr = struct.pack("!HHI", STUN_ATTR_FINGERPRINT, 4, fingerprint_val)
+        body_with_all = body_with_mi_sha256 + fp_attr
+        header = struct.pack("!HHI12s", msg_type, len(body_with_all), STUN_MAGIC_COOKIE, tid)
+        msg = header + body_with_all
+    else:
+        header = struct.pack("!HHI12s", msg_type, len(body_with_mi_sha256), STUN_MAGIC_COOKIE, tid)
+        msg = header + body_with_mi_sha256
+    
+    return msg
+
+
+def build_msg_with_short_term_credential_sha1_only(msg_type, tid, attrs, integrity_key, add_fingerprint=False):
+    """构建包含短期凭证认证的STUN消息（仅使用MESSAGE-INTEGRITY）
+    
+    属性顺序：USERNAME -> MESSAGE-INTEGRITY -> FINGERPRINT
+    
+    Args:
+        msg_type: 消息类型
+        tid: 事务ID
+        attrs: 属性列表（不包含认证相关属性）
+        integrity_key: HMAC密钥（OpaqueString(password)）
+        add_fingerprint: 是否添加FINGERPRINT属性
+    
+    Returns:
+        构建好的STUN消息（字节串）
+    """
+    body = b"".join(attrs)
+    
+    # 创建占位符
+    mi_dummy = b"\x00" * 20  # MESSAGE-INTEGRITY 占位符（20字节）
+    
+    # 构建带占位符的消息体
+    mi_attr_dummy = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY, len(mi_dummy)) + mi_dummy
+    body_with_mi_dummy = body + mi_attr_dummy
+    
+    # 如果使用FINGERPRINT，添加占位符
+    fp_attr_dummy = None
+    if add_fingerprint:
+        fp_attr_dummy = struct.pack("!HHI", STUN_ATTR_FINGERPRINT, 4, 0)
+        body_with_mi_dummy_and_fp_dummy = body_with_mi_dummy + fp_attr_dummy
+        header_for_sha1 = struct.pack("!HHI12s", msg_type, len(body_with_mi_dummy_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+    else:
+        header_for_sha1 = struct.pack("!HHI12s", msg_type, len(body_with_mi_dummy), STUN_MAGIC_COOKIE, tid)
+    msg_for_sha1 = header_for_sha1 + body  # HMAC计算时不包含FINGERPRINT dummy
+    
+    # 计算 HMAC-SHA1
+    hmac_sha1_val = hmac.new(integrity_key, msg_for_sha1, hashlib.sha1).digest()
+    
+    # 替换 MESSAGE-INTEGRITY 占位符
+    mi_attr = struct.pack("!HH", STUN_ATTR_MESSAGE_INTEGRITY, len(hmac_sha1_val)) + hmac_sha1_val
+    body_with_mi = body + mi_attr
+    
+    # 如果使用FINGERPRINT，计算并添加
+    if add_fingerprint:
+        body_with_mi_and_fp_dummy = body_with_mi + fp_attr_dummy
+        header_for_fp = struct.pack("!HHI12s", msg_type, len(body_with_mi_and_fp_dummy), STUN_MAGIC_COOKIE, tid)
+        
+        # 计算CRC32（不包含FINGERPRINT）
+        msg_for_crc = header_for_fp + body_with_mi
+        crc32_val = zlib.crc32(msg_for_crc) & 0xffffffff
+        fingerprint_val = crc32_val ^ 0x5354554e
+        
+        # 替换FINGERPRINT占位符
+        fp_attr = struct.pack("!HHI", STUN_ATTR_FINGERPRINT, 4, fingerprint_val)
+        body_with_all = body_with_mi + fp_attr
+        header = struct.pack("!HHI12s", msg_type, len(body_with_all), STUN_MAGIC_COOKIE, tid)
+        msg = header + body_with_all
+    else:
+        header = struct.pack("!HHI12s", msg_type, len(body_with_mi), STUN_MAGIC_COOKIE, tid)
+        msg = header + body_with_mi
+    
+    return msg
+
+
 def parse_attrs(data):
     attrs = {}
     msg_type, msg_len, magic, tid = struct.unpack("!HHI12s", data[:20])
@@ -269,8 +807,16 @@ def parse_attrs(data):
         pos += 4 + ((alen + 3) // 4) * 4
     return msg_type, tid, attrs
 
-def allocate_single_server(server_address, username=None, password=None, realm=None):
-    """向单个服务器分配UDP TURN中继地址"""
+def allocate_single_server(server_address, username=None, password=None, realm=None, use_short_term_credential=False):
+    """向单个服务器分配UDP TURN中继地址
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     # 使用传入的认证信息或默认值
     auth_username = username or USERNAME
     auth_password = password or PASSWORD
@@ -279,51 +825,228 @@ def allocate_single_server(server_address, username=None, password=None, realm=N
     sock.settimeout(3)
 
     try:
-        # 1. 第一次 Allocate 请求（无认证）
-        tid1 = gen_tid()
-        req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (UDP=17)
-        ])
-        sock.sendto(req1, server_address)
-        data, _ = sock.recvfrom(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] First resp attrs:", attrs)
+        if use_short_term_credential:
+            # 短期凭证：直接发送带认证的请求，不需要nonce/realm
+            # 短期凭证的HMAC密钥直接使用password（OpaqueString profile）
+            integrity_key = opaque_string(auth_password)
+            print(f"[+] Using short-term credential mechanism")
+            print(f"[+] HMAC key (password): {auth_password}")
+            print(f"[+] HMAC key (bytes): {integrity_key.hex()}")
+            
+            attrs = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT
+            ]
+            
+            # 根据 RFC 8489 Section 9.1.2，默认情况下必须同时包含 MESSAGE-INTEGRITY-SHA256 和 MESSAGE-INTEGRITY
+            tid = gen_tid()
+            req = build_msg_with_short_term_credential(STUN_ALLOCATE_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+            sock.sendto(req, server_address)
+            
+            try:
+                data, _ = sock.recvfrom(2000)
+                msg_type, tid, resp_attrs = parse_attrs(data)
+                print("[+] Allocate response attrs:", resp_attrs)
+            except socket.timeout:
+                print("[-] Timeout waiting for response")
+                sock.close()
+                return None
+            
+            # 检查响应状态
+            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                print("[+] UDP TURN allocation successful")
+                
+                # 检测服务器在响应中使用的算法类型（用于后续请求，RFC 8489 Section 9.1.5）
+                has_sha256 = STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in resp_attrs
+                has_sha1 = STUN_ATTR_MESSAGE_INTEGRITY in resp_attrs
+                
+                if has_sha256:
+                    mi_algorithm = 'sha256'
+                    print(f"[+] Server uses MESSAGE-INTEGRITY-SHA256, subsequent requests will use SHA256 only (RFC 8489 Section 9.1.5)")
+                elif has_sha1:
+                    mi_algorithm = 'sha1'
+                    print(f"[+] Server uses MESSAGE-INTEGRITY, subsequent requests will use SHA1 only (RFC 8489 Section 9.1.5)")
+                else:
+                    mi_algorithm = 'both'  # 默认
+                    print(f"[!] Warning: No MI attribute in response, using method: {mi_algorithm}")
+                
+                # 根据 RFC 8489 Section 9.1.4，验证响应中的消息完整性
+                is_valid, verified_algorithm = verify_short_term_response_integrity(data, integrity_key, expected_algorithm='both')
+                if not is_valid:
+                    print("[!] Response integrity verification failed per RFC 8489 Section 9.1.4")
+                    # 根据 RFC 8489 Section 9.1.4，对于不可靠传输，丢弃响应
+                    print("[!] Discarding response (unreliable transport)")
+                    sock.close()
+                    return None
+                
+                if verified_algorithm and verified_algorithm != mi_algorithm:
+                    # 如果验证函数返回的算法与检测到的不一致，使用验证函数返回的
+                    mi_algorithm = verified_algorithm
+                
+                nonce = None
+                server_realm = None
+                attrs = resp_attrs
+            elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                error_code = resp_attrs.get(STUN_ATTR_ERROR_CODE)
+                if error_code:
+                    error_class = error_code[2]
+                    error_number = error_code[3]
+                    error_reason = error_code[4:].decode('utf-8', errors='ignore')
+                    print(f"[-] Error: {error_class}{error_number:02d} {error_reason}")
+                print("[-] UDP TURN allocation failed")
+                sock.close()
+                return None
+            else:
+                print(f"[-] Unexpected response type: 0x{msg_type:04x}")
+                sock.close()
+                return None
+        else:
+            # 长期凭证：按照 RFC 8489 Section 9.2
+            # 1. 第一次 Allocate 请求（无认证，RFC 8489 Section 9.2.3.1）
+            print("[+] Using long-term credential mechanism")
+            print("[+] Step 1: Sending first request without authentication (RFC 8489 Section 9.2.3.1)")
+            tid1 = gen_tid()
+            req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (UDP=17)
+            ])
+            sock.sendto(req1, server_address)
+            data, _ = sock.recvfrom(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] First response attrs:", attrs)
 
-        # 提取 nonce 和 realm
-        nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
-        server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
-        if not (nonce and server_realm):
-            print("[-] No nonce/realm in response, exiting")
-            sock.close()
-            return None
+            # 检查响应：应该是 401 并包含 REALM 和 NONCE (RFC 8489 Section 9.2.4)
+            if msg_type != STUN_ALLOCATE_ERROR_RESPONSE:
+                print("[-] Expected 401 error response for first request")
+                sock.close()
+                return None
+            
+            error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+            if error_code:
+                error_class = error_code[2]
+                error_number = error_code[3]
+                if error_class != 4 or error_number != 1:
+                    print(f"[-] Expected 401 error, got {error_class}{error_number:02d}")
+                    sock.close()
+                    return None
 
-        print(f"[+] Got nonce={nonce}, realm={server_realm}")
+            # 提取 nonce 和 realm
+            nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
+            server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
+            password_algorithms = attrs.get(STUN_ATTR_PASSWORD_ALGORITHMS)  # PASSWORD-ALGORITHMS (可选)
+            
+            if not (nonce and server_realm):
+                print("[-] No nonce/realm in 401 response, exiting")
+                sock.close()
+                return None
 
-        # 2. 第二次 Allocate 请求
-        tid2 = gen_tid()
-        key_str = f"{auth_username}:{server_realm.decode()}:{auth_password}"
-        print(f"[+] HMAC key string: {key_str}")
-        integrity_key = hashlib.md5(key_str.encode()).digest()
-        print(f"[+] HMAC key: {integrity_key.hex()}")
+            print(f"[+] Got nonce={nonce}, realm={server_realm}")
+            
+            # 检查 nonce cookie (RFC 8489 Section 9.2)
+            has_cookie, security_features = check_nonce_cookie(nonce)
+            if has_cookie:
+                print("[+] Nonce has cookie prefix (RFC 8489 compliant)")
+                if security_features:
+                    print(f"[+] Security features: {security_features.hex()}")
+            
+            # 处理 PASSWORD-ALGORITHMS（如果存在）
+            selected_password_algorithm = None
+            if password_algorithms:
+                algorithms = parse_password_algorithms(password_algorithms)
+                print(f"[+] Server supports password algorithms: {algorithms}")
+                # 选择第一个支持的算法（通常是 MD5=0x0001，SHA-256=0x0002）
+                if algorithms:
+                    selected_password_algorithm = algorithms[0]
+                    print(f"[+] Selected password algorithm: 0x{selected_password_algorithm:04x}")
 
-        attrs2 = [
-            stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
-            stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
-            stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT
-        ]
+            # 2. 第二次 Allocate 请求（RFC 8489 Section 9.2.3.2）
+            print("[+] Step 2: Sending authenticated request")
+            tid2 = gen_tid()
+            
+            # 计算 HMAC Key（使用 OpaqueString 处理 realm 和 password）
+            integrity_key = compute_long_term_hmac_key(auth_username, server_realm, auth_password)
+            print(f"[+] Computed HMAC key (MD5): {integrity_key.hex()}")
 
-        req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
-        sock.sendto(req2, server_address)
+            attrs2 = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
+                stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT
+            ]
+            
+            # 如果服务器提供了 PASSWORD-ALGORITHMS，必须在请求中包含
+            if password_algorithms:
+                attrs2.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHMS, password_algorithms))
+                if selected_password_algorithm:
+                    attrs2.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHM, struct.pack("!H", selected_password_algorithm)))
 
-        data, _ = sock.recvfrom(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] Final resp attrs:", attrs)
+            req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
+            sock.sendto(req2, server_address)
+
+            data, _ = sock.recvfrom(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] Final response attrs:", attrs)
+            
+            # 检测服务器使用的消息完整性算法
+            mi_algorithm = None
+            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                if STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in attrs:
+                    mi_algorithm = 'sha256'
+                    print("[+] Server uses MESSAGE-INTEGRITY-SHA256")
+                elif STUN_ATTR_MESSAGE_INTEGRITY in attrs:
+                    mi_algorithm = 'sha1'
+                    print("[+] Server uses MESSAGE-INTEGRITY (SHA1)")
+            
+            # 处理 438 (Stale Nonce) 错误
+            if msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+                if error_code:
+                    error_class = error_code[2]
+                    error_number = error_code[3]
+                    if error_class == 4 and error_number == 38:  # 438 Stale Nonce
+                        print("[+] Received 438 Stale Nonce, retrying with new nonce")
+                        new_nonce = attrs.get(STUN_ATTR_NONCE)
+                        new_realm = attrs.get(STUN_ATTR_REALM)
+                        new_password_algorithms = attrs.get(STUN_ATTR_PASSWORD_ALGORITHMS)
+                        
+                        if new_nonce and new_realm:
+                            nonce = new_nonce
+                            server_realm = new_realm
+                            if new_password_algorithms:
+                                password_algorithms = new_password_algorithms
+                                algorithms = parse_password_algorithms(password_algorithms)
+                                if algorithms:
+                                    selected_password_algorithm = algorithms[0]
+                            
+                            # 使用新的 nonce 重试
+                            tid3 = gen_tid()
+                            integrity_key = compute_long_term_hmac_key(auth_username, server_realm, auth_password)
+                            attrs3 = [
+                                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
+                                stun_attr(STUN_ATTR_REALM, server_realm),
+                                stun_attr(STUN_ATTR_NONCE, nonce),
+                                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),
+                            ]
+                            if password_algorithms:
+                                attrs3.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHMS, password_algorithms))
+                                if selected_password_algorithm:
+                                    attrs3.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHM, struct.pack("!H", selected_password_algorithm)))
+                            
+                            req3 = build_msg(STUN_ALLOCATE_REQUEST, tid3, attrs3, integrity_key, add_fingerprint=True)
+                            sock.sendto(req3, server_address)
+                            data, _ = sock.recvfrom(2000)
+                            msg_type, tid, attrs = parse_attrs(data)
+                            print("[+] Retry response attrs:", attrs)
+                            
+                            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                                if STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in attrs:
+                                    mi_algorithm = 'sha256'
+                                elif STUN_ATTR_MESSAGE_INTEGRITY in attrs:
+                                    mi_algorithm = 'sha1'
         
         # 检查响应状态
         if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
             print("[+] UDP TURN allocation successful")
-            return sock, nonce, server_realm, integrity_key
+            return sock, nonce, server_realm, integrity_key, server_address, mi_algorithm
         elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
             print("[-] UDP TURN allocation failed: Error response")
             # 检查错误码
@@ -344,8 +1067,8 @@ def allocate_single_server(server_address, username=None, password=None, realm=N
                         if alt_addr:
                             print(f"[+] Found alternate server: {alt_addr[0]}:{alt_addr[1]}")
                             sock.close()
-                            # 递归调用使用备用服务器
-                            return allocate_single_server(alt_addr, username, password, realm)
+                            # 递归调用使用备用服务器（注意：返回值包含 mi_algorithm）
+                            return allocate_single_server(alt_addr, username, password, realm, use_short_term_credential)
                         else:
                             print(f"[-] Failed to parse alternate server address: {alternate_server.hex()}")
                     else:
@@ -364,8 +1087,17 @@ def allocate_single_server(server_address, username=None, password=None, realm=N
         sock.close()
         return None
 
-def allocate_single_server_with_alternate(server_address, username=None, password=None, realm=None, tried_alternate_servers=None):
-    """向单个服务器分配UDP TURN中继地址，支持ALTERNATE-SERVER重试"""
+def allocate_single_server_with_alternate(server_address, username=None, password=None, realm=None, tried_alternate_servers=None, use_short_term_credential=False):
+    """向单个服务器分配UDP TURN中继地址，支持ALTERNATE-SERVER重试
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        tried_alternate_servers: 已尝试的备用服务器集合
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     if tried_alternate_servers is None:
         tried_alternate_servers = set()
     
@@ -377,51 +1109,248 @@ def allocate_single_server_with_alternate(server_address, username=None, passwor
     sock.settimeout(3)
 
     try:
-        # 1. 第一次 Allocate 请求（无认证）
-        tid1 = gen_tid()
-        req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (UDP=17)
-        ])
-        sock.sendto(req1, server_address)
-        data, _ = sock.recvfrom(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] First resp attrs:", attrs)
+        if use_short_term_credential:
+            # 短期凭证：直接发送带认证的请求，不需要nonce/realm
+            # 短期凭证的HMAC密钥直接使用password（OpaqueString profile）
+            integrity_key = opaque_string(auth_password)
+            print(f"[+] Using short-term credential mechanism")
+            print(f"[+] HMAC key (password): {auth_password}")
+            print(f"[+] HMAC key (bytes): {integrity_key.hex()}")
+            
+            attrs = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT
+            ]
+            
+            # 尝试不同的认证方法：先尝试同时包含两个MESSAGE-INTEGRITY，如果400则回退
+            build_methods = [
+                ("both", build_msg_with_short_term_credential),  # 同时包含 SHA256 和 SHA1
+                ("sha256_only", build_msg_with_short_term_credential_sha256_only),  # 仅 SHA256
+                ("sha1_only", build_msg_with_short_term_credential_sha1_only),  # 仅 SHA1
+            ]
+            
+            msg_type = None
+            tid = None
+            resp_attrs = None
+            mi_algorithm = None  # 服务器使用的算法类型
+            
+            for method_name, build_func in build_methods:
+                tid = gen_tid()
+                print(f"[+] Trying authentication method: {method_name}")
+                req = build_func(STUN_ALLOCATE_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+                sock.sendto(req, server_address)
+                
+                try:
+                    data, _ = sock.recvfrom(2000)
+                    msg_type, tid, resp_attrs = parse_attrs(data)
+                    print("[+] Allocate response attrs:", resp_attrs)
+                    
+                    # 检查响应状态
+                    if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                        print(f"[+] UDP TURN allocation successful with method: {method_name}")
+                        # 检测服务器在响应中使用的算法类型（用于后续请求）
+                        if STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in resp_attrs:
+                            mi_algorithm = 'sha256'
+                            print(f"[+] Server uses MESSAGE-INTEGRITY-SHA256, subsequent requests will use SHA256 only")
+                        elif STUN_ATTR_MESSAGE_INTEGRITY in resp_attrs:
+                            mi_algorithm = 'sha1'
+                            print(f"[+] Server uses MESSAGE-INTEGRITY, subsequent requests will use SHA1 only")
+                        else:
+                            # 如果响应中没有找到，使用当前成功的方法
+                            if method_name == 'sha256_only':
+                                mi_algorithm = 'sha256'
+                            elif method_name == 'sha1_only':
+                                mi_algorithm = 'sha1'
+                            else:
+                                mi_algorithm = 'both'  # 默认
+                            print(f"[+] Warning: No MI attribute in response, using method: {mi_algorithm}")
+                        break  # 成功，退出循环
+                    elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                        error_code = resp_attrs.get(STUN_ATTR_ERROR_CODE)
+                        if error_code:
+                            error_class = error_code[2]
+                            error_number = error_code[3]
+                            error_reason = error_code[4:].decode('utf-8', errors='ignore')
+                            print(f"[-] Error: {error_class}{error_number:02d} {error_reason}")
+                            
+                            # 如果是400错误且还有备选方法，继续尝试
+                            if error_class == 4 and error_number == 0 and build_methods.index((method_name, build_func)) < len(build_methods) - 1:
+                                print(f"[+] Got 400 error, trying next method...")
+                                continue
+                            else:
+                                # 不是400错误，或者已经是最后一个方法，退出循环
+                                break
+                        else:
+                            break
+                    else:
+                        print(f"[-] Unexpected response type: 0x{msg_type:04x}")
+                        break
+                except socket.timeout:
+                    print(f"[-] Timeout with method: {method_name}")
+                    if build_methods.index((method_name, build_func)) < len(build_methods) - 1:
+                        print(f"[+] Trying next method...")
+                        continue
+                    else:
+                        break
+            
+            # 短期凭证不需要nonce和realm，返回None作为占位符
+            nonce = None
+            server_realm = None
+            # 如果所有方法都失败，resp_attrs 可能为 None
+            if resp_attrs is None:
+                attrs = {}
+            else:
+                attrs = resp_attrs
+        else:
+            # 长期凭证：按照 RFC 8489 Section 9.2
+            # 1. 第一次 Allocate 请求（无认证，RFC 8489 Section 9.2.3.1）
+            print("[+] Using long-term credential mechanism")
+            print("[+] Step 1: Sending first request without authentication (RFC 8489 Section 9.2.3.1)")
+            tid1 = gen_tid()
+            req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (UDP=17)
+            ])
+            sock.sendto(req1, server_address)
+            data, _ = sock.recvfrom(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] First response attrs:", attrs)
 
-        # 提取 nonce 和 realm
-        nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
-        server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
-        if not (nonce and server_realm):
-            print("[-] No nonce/realm in response, exiting")
-            sock.close()
-            return None
+            # 检查响应：应该是 401 并包含 REALM 和 NONCE (RFC 8489 Section 9.2.4)
+            if msg_type != STUN_ALLOCATE_ERROR_RESPONSE:
+                print("[-] Expected 401 error response for first request")
+                sock.close()
+                return None
+            
+            error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+            if error_code:
+                error_class = error_code[2]
+                error_number = error_code[3]
+                if error_class != 4 or error_number != 1:
+                    print(f"[-] Expected 401 error, got {error_class}{error_number:02d}")
+                    sock.close()
+                    return None
 
-        print(f"[+] Got nonce={nonce}, realm={server_realm}")
+            # 提取 nonce 和 realm
+            nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
+            server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
+            password_algorithms = attrs.get(STUN_ATTR_PASSWORD_ALGORITHMS)  # PASSWORD-ALGORITHMS (可选)
+            
+            if not (nonce and server_realm):
+                print("[-] No nonce/realm in 401 response, exiting")
+                sock.close()
+                return None
 
-        # 2. 第二次 Allocate 请求
-        tid2 = gen_tid()
-        key_str = f"{auth_username}:{server_realm.decode()}:{auth_password}"
-        print(f"[+] HMAC key string: {key_str}")
-        integrity_key = hashlib.md5(key_str.encode()).digest()
-        print(f"[+] HMAC key: {integrity_key.hex()}")
+            print(f"[+] Got nonce={nonce}, realm={server_realm}")
+            
+            # 检查 nonce cookie (RFC 8489 Section 9.2)
+            has_cookie, security_features = check_nonce_cookie(nonce)
+            if has_cookie:
+                print("[+] Nonce has cookie prefix (RFC 8489 compliant)")
+                if security_features:
+                    print(f"[+] Security features: {security_features.hex()}")
+            
+            # 处理 PASSWORD-ALGORITHMS（如果存在）
+            selected_password_algorithm = None
+            if password_algorithms:
+                algorithms = parse_password_algorithms(password_algorithms)
+                print(f"[+] Server supports password algorithms: {algorithms}")
+                # 选择第一个支持的算法（通常是 MD5=0x0001，SHA-256=0x0002）
+                if algorithms:
+                    selected_password_algorithm = algorithms[0]
+                    print(f"[+] Selected password algorithm: 0x{selected_password_algorithm:04x}")
 
-        attrs2 = [
-            stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
-            stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
-            stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT
-        ]
+            # 2. 第二次 Allocate 请求（RFC 8489 Section 9.2.3.2）
+            print("[+] Step 2: Sending authenticated request")
+            tid2 = gen_tid()
+            
+            # 计算 HMAC Key（使用 OpaqueString 处理 realm 和 password）
+            integrity_key = compute_long_term_hmac_key(auth_username, server_realm, auth_password)
+            print(f"[+] Computed HMAC key (MD5): {integrity_key.hex()}")
 
-        req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
-        sock.sendto(req2, server_address)
+            attrs2 = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
+                stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT
+            ]
+            
+            # 如果服务器提供了 PASSWORD-ALGORITHMS，必须在请求中包含
+            if password_algorithms:
+                attrs2.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHMS, password_algorithms))
+                if selected_password_algorithm:
+                    attrs2.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHM, struct.pack("!H", selected_password_algorithm)))
 
-        data, _ = sock.recvfrom(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] Final resp attrs:", attrs)
+            req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
+            sock.sendto(req2, server_address)
+
+            data, _ = sock.recvfrom(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] Final response attrs:", attrs)
+            
+            # 检测服务器使用的消息完整性算法
+            mi_algorithm = None
+            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                if STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in attrs:
+                    mi_algorithm = 'sha256'
+                    print("[+] Server uses MESSAGE-INTEGRITY-SHA256")
+                elif STUN_ATTR_MESSAGE_INTEGRITY in attrs:
+                    mi_algorithm = 'sha1'
+                    print("[+] Server uses MESSAGE-INTEGRITY (SHA1)")
+            
+            # 处理 438 (Stale Nonce) 错误
+            if msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+                if error_code:
+                    error_class = error_code[2]
+                    error_number = error_code[3]
+                    if error_class == 4 and error_number == 38:  # 438 Stale Nonce
+                        print("[+] Received 438 Stale Nonce, retrying with new nonce")
+                        new_nonce = attrs.get(STUN_ATTR_NONCE)
+                        new_realm = attrs.get(STUN_ATTR_REALM)
+                        new_password_algorithms = attrs.get(STUN_ATTR_PASSWORD_ALGORITHMS)
+                        
+                        if new_nonce and new_realm:
+                            nonce = new_nonce
+                            server_realm = new_realm
+                            if new_password_algorithms:
+                                password_algorithms = new_password_algorithms
+                                algorithms = parse_password_algorithms(password_algorithms)
+                                if algorithms:
+                                    selected_password_algorithm = algorithms[0]
+                            
+                            # 使用新的 nonce 重试
+                            tid3 = gen_tid()
+                            integrity_key = compute_long_term_hmac_key(auth_username, server_realm, auth_password)
+                            attrs3 = [
+                                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
+                                stun_attr(STUN_ATTR_REALM, server_realm),
+                                stun_attr(STUN_ATTR_NONCE, nonce),
+                                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),
+                            ]
+                            if password_algorithms:
+                                attrs3.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHMS, password_algorithms))
+                                if selected_password_algorithm:
+                                    attrs3.append(stun_attr(STUN_ATTR_PASSWORD_ALGORITHM, struct.pack("!H", selected_password_algorithm)))
+                            
+                            req3 = build_msg(STUN_ALLOCATE_REQUEST, tid3, attrs3, integrity_key, add_fingerprint=True)
+                            sock.sendto(req3, server_address)
+                            data, _ = sock.recvfrom(2000)
+                            msg_type, tid, attrs = parse_attrs(data)
+                            print("[+] Retry response attrs:", attrs)
+                            
+                            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                                if STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in attrs:
+                                    mi_algorithm = 'sha256'
+                                elif STUN_ATTR_MESSAGE_INTEGRITY in attrs:
+                                    mi_algorithm = 'sha1'
         
         # 检查响应状态
         if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
             print("[+] UDP TURN allocation successful")
-            return sock, nonce, server_realm, integrity_key, server_address
+            # 对于长期凭证，mi_algorithm 为 None，后续请求使用默认的 build_msg
+            if not use_short_term_credential:
+                mi_algorithm = None
+            return sock, nonce, server_realm, integrity_key, server_address, mi_algorithm
         elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
             print("[-] UDP TURN allocation failed: Error response")
             # 检查错误码
@@ -455,7 +1384,7 @@ def allocate_single_server_with_alternate(server_address, username=None, passwor
                             sock.close()
                             print(f"[+] Recursively trying ALTERNATE-SERVER {alt_server_str}")
                             # 递归调用使用备用服务器
-                            return allocate_single_server_with_alternate(alt_addr, username, password, realm, tried_alternate_servers)
+                            return allocate_single_server_with_alternate(alt_addr, username, password, realm, tried_alternate_servers, use_short_term_credential)
                         else:
                             print(f"[-] Failed to parse alternate server address: {alternate_server.hex()}")
                     else:
@@ -474,8 +1403,17 @@ def allocate_single_server_with_alternate(server_address, username=None, passwor
         sock.close()
         return None
 
-def allocate(server_address=None, username=None, password=None, realm=None, server_hostname=None):
-    """分配UDP TURN中继地址，支持多IP备选和自动重试"""
+def allocate(server_address=None, username=None, password=None, realm=None, server_hostname=None, use_short_term_credential=False):
+    """分配UDP TURN中继地址，支持多IP备选和自动重试
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        server_hostname: 服务器主机名（用于DNS发现）
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
     
@@ -497,7 +1435,7 @@ def allocate(server_address=None, username=None, password=None, realm=None, serv
         current_address = (ip, server_port)
         print(f"[+] Attempt {i+1}/{len(server_ips)}: Trying {current_address}")
         
-        result = allocate_single_server_with_alternate(current_address, username, password, realm, tried_alternate_servers)
+        result = allocate_single_server_with_alternate(current_address, username, password, realm, tried_alternate_servers, use_short_term_credential)
         if result:
             # result现在包含实际连接的服务器地址
             actual_connected_address = result[4] if len(result) > 4 else current_address
@@ -510,8 +1448,17 @@ def allocate(server_address=None, username=None, password=None, realm=None, serv
     return None
 
 
-def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False):
-    """向单个服务器分配TCP TURN中继地址（使用TCP传输）"""
+def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, use_short_term_credential=False):
+    """向单个服务器分配TCP TURN中继地址（使用TCP传输）
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        use_tls: 是否使用TLS
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     # 使用传入的认证信息或默认值
     auth_username = username or USERNAME
     auth_password = password or PASSWORD
@@ -535,50 +1482,130 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
             control_sock = context.wrap_socket(control_sock, server_hostname=server_address[0])
             print("[+] TLS connection established")
         
-        # 1. 第一次 Allocate 请求（无认证）
-        tid1 = gen_tid()
-        req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (TCP=6)
-        ])
-        control_sock.send(req1)
-        
-        # 接收响应
-        data = control_sock.recv(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] First TCP resp attrs:", attrs)
+        if use_short_term_credential:
+            # 短期凭证：直接发送带认证的请求，不需要nonce/realm
+            # 短期凭证的HMAC密钥直接使用password（OpaqueString profile）
+            integrity_key = opaque_string(auth_password)
+            print(f"[+] Using short-term credential mechanism")
+            print(f"[+] HMAC key (password): {auth_password}")
+            print(f"[+] HMAC key (bytes): {integrity_key.hex()}")
+            
+            attrs = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (TCP=6)
+            ]
+            
+            # 根据 RFC 8489 Section 9.1.2，默认情况下必须同时包含 MESSAGE-INTEGRITY-SHA256 和 MESSAGE-INTEGRITY
+            tid = gen_tid()
+            req = build_msg_with_short_term_credential(STUN_ALLOCATE_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+            control_sock.send(req)
+            
+            try:
+                data = control_sock.recv(2000)
+                msg_type, tid, resp_attrs = parse_attrs(data)
+                print("[+] Allocate response attrs:", resp_attrs)
+            except socket.timeout:
+                print("[-] Timeout waiting for response")
+                control_sock.close()
+                return None
+            
+            # 检查响应状态
+            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                print("[+] TCP TURN allocation successful")
+                
+                # 检测服务器在响应中使用的算法类型（用于后续请求，RFC 8489 Section 9.1.5）
+                has_sha256 = STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in resp_attrs
+                has_sha1 = STUN_ATTR_MESSAGE_INTEGRITY in resp_attrs
+                
+                if has_sha256:
+                    mi_algorithm = 'sha256'
+                    print(f"[+] Server uses MESSAGE-INTEGRITY-SHA256, subsequent requests will use SHA256 only (RFC 8489 Section 9.1.5)")
+                elif has_sha1:
+                    mi_algorithm = 'sha1'
+                    print(f"[+] Server uses MESSAGE-INTEGRITY, subsequent requests will use SHA1 only (RFC 8489 Section 9.1.5)")
+                else:
+                    mi_algorithm = 'both'  # 默认
+                    print(f"[!] Warning: No MI attribute in response, using method: {mi_algorithm}")
+                
+                # 根据 RFC 8489 Section 9.1.4，验证响应中的消息完整性
+                is_valid, verified_algorithm = verify_short_term_response_integrity(data, integrity_key, expected_algorithm='both')
+                if not is_valid:
+                    print("[!] Response integrity verification failed per RFC 8489 Section 9.1.4")
+                    # 根据 RFC 8489 Section 9.1.4，对于可靠传输，立即结束事务并报告完整性保护违规
+                    print("[!] Ending transaction (reliable transport) - integrity protection violated")
+                    control_sock.close()
+                    return None
+                
+                if verified_algorithm and verified_algorithm != mi_algorithm:
+                    mi_algorithm = verified_algorithm
+                
+                nonce = None
+                server_realm = None
+                attrs = resp_attrs
+            elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                error_code = resp_attrs.get(STUN_ATTR_ERROR_CODE)
+                if error_code:
+                    error_class = error_code[2]
+                    error_number = error_code[3]
+                    error_reason = error_code[4:].decode('utf-8', errors='ignore')
+                    print(f"[-] Error: {error_class}{error_number:02d} {error_reason}")
+                print("[-] TCP TURN allocation failed")
+                control_sock.close()
+                return None
+            else:
+                print(f"[-] Unexpected response type: 0x{msg_type:04x}")
+                control_sock.close()
+                return None
+        else:
+            # 长期凭证：先发送无认证请求获取nonce和realm
+            # 1. 第一次 Allocate 请求（无认证）
+            tid1 = gen_tid()
+            req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, [
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00"))  # REQUESTED-TRANSPORT (TCP=6)
+            ])
+            control_sock.send(req1)
+            
+            # 接收响应
+            data = control_sock.recv(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] First TCP resp attrs:", attrs)
 
-        # 提取 nonce 和 realm
-        nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
-        server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
-        if not (nonce and server_realm):
-            print("[-] No nonce/realm in response, exiting")
-            return
+            # 提取 nonce 和 realm
+            nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
+            server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
+            if not (nonce and server_realm):
+                print("[-] No nonce/realm in response, exiting")
+                return
 
-        print(f"[+] Got nonce={nonce}, realm={server_realm}")
+            print(f"[+] Got nonce={nonce}, realm={server_realm}")
 
-        # 2. 第二次 Allocate 请求
-        tid2 = gen_tid()
-        key_str = f"{auth_username}:{server_realm.decode()}:{auth_password}"
-        integrity_key = hashlib.md5(key_str.encode()).digest()
+            # 2. 第二次 Allocate 请求
+            tid2 = gen_tid()
+            # 长期凭证的HMAC密钥：MD5(username:realm:password)
+            key_str = f"{auth_username}:{server_realm.decode()}:{auth_password}"
+            integrity_key = hashlib.md5(key_str.encode()).digest()
 
-        attrs2 = [
-            stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
-            stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
-            stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (TCP=6, RFC6062规定TCP使用TCP传输)
-        ]
+            attrs2 = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
+                stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 6, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (TCP=6, RFC6062规定TCP使用TCP传输)
+            ]
 
-        req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
-        control_sock.send(req2)
+            req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
+            control_sock.send(req2)
 
-        data = control_sock.recv(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] Final TCP resp attrs:", attrs)
+            data = control_sock.recv(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] Final TCP resp attrs:", attrs)
         
         # 检查响应状态
         if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
             print("[+] TCP TURN allocation successful")
-            return control_sock, nonce, server_realm, integrity_key, server_address
+            # 对于长期凭证，mi_algorithm 为 None，后续请求使用默认的 build_msg
+            if not use_short_term_credential:
+                mi_algorithm = None
+            return control_sock, nonce, server_realm, integrity_key, server_address, mi_algorithm
         elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
             print("[-] TCP TURN allocation failed: Error response")
             # 检查错误码
@@ -599,13 +1626,17 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
                             print(f"[+] Found alternate server: {alt_addr[0]}:{alt_addr[1]}")
                             control_sock.close()
                             # 递归调用使用备用服务器
-                            return allocate_tcp_single_server(alt_addr, username, password, realm, use_tls)
+                            return allocate_tcp_single_server(alt_addr, username, password, realm, use_tls, use_short_term_credential)
                         else:
                             print("[-] Failed to parse alternate server address")
                     else:
                         print("[+] No alternate server provided")
                         control_sock.close()
                         return None
+            control_sock.close()
+            return None
+        elif msg_type is None:
+            print("[-] TCP TURN allocation failed: All authentication methods timed out or failed")
             control_sock.close()
             return None
         else:
@@ -618,8 +1649,18 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
         control_sock.close()
         return None
 
-def allocate_tcp_udp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None):
-    """分配TCP连接但UDP中继的TURN地址，支持多IP备选和自动重试"""
+def allocate_tcp_udp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False):
+    """分配TCP连接但UDP中继的TURN地址，支持多IP备选和自动重试
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        use_tls: 是否使用TLS
+        server_hostname: 服务器主机名（用于DNS发现和TLS）
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
     
@@ -642,7 +1683,7 @@ def allocate_tcp_udp(server_address=None, username=None, password=None, realm=No
         current_address = (ip, server_address[1])
         print(f"[+] TCP+UDP Attempt {i}/{len(ips)}: Trying {current_address}")
         
-        result = allocate_tcp_udp_single_server(current_address, username, password, realm, use_tls, server_hostname)
+        result = allocate_tcp_udp_single_server(current_address, username, password, realm, use_tls, server_hostname, use_short_term_credential)
         if result:
             print(f"[+] Successfully allocated TCP+UDP on {current_address}")
             return result
@@ -652,8 +1693,18 @@ def allocate_tcp_udp(server_address=None, username=None, password=None, realm=No
     print("[-] All TCP+UDP IP addresses failed")
     return None
 
-def allocate_tcp_udp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, server_hostname=None):
-    """向单个服务器分配TCP连接但UDP中继的TURN地址"""
+def allocate_tcp_udp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False):
+    """向单个服务器分配TCP连接但UDP中继的TURN地址
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        use_tls: 是否使用TLS
+        server_hostname: 服务器主机名（用于TLS）
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     # 使用传入的认证信息或默认值
     auth_username = username or USERNAME
     auth_password = password or PASSWORD
@@ -677,121 +1728,197 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
             control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
             print("[+] TLS connection established")
         
-        # 第一次分配请求（无认证）
-        tid1 = gen_tid()
-        attrs1 = [
-            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (UDP=17)
-        ]
-        
-        req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, attrs1, None, add_fingerprint=False)
-        control_sock.send(req1)
-        
-        # 接收第一次响应
-        data = control_sock.recv(2000)
-        msg_type, tid, attrs = parse_attrs(data)
-        print("[+] First TCP+UDP resp attrs:", attrs)
-        
-        # 检查响应类型
-        if msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
-            # 检查错误代码
-            error_code = attrs.get(9)
-            # 检查是否是401 Unauthorized错误
-            is_unauthorized = False
-            if error_code:
-                # 检查错误代码格式: 前2字节是错误类，第3字节是错误号
-                if len(error_code) >= 4:
+        if use_short_term_credential:
+            # 短期凭证：直接发送带认证的请求，不需要nonce/realm
+            # 短期凭证的HMAC密钥直接使用password（OpaqueString profile）
+            integrity_key = opaque_string(auth_password)
+            print(f"[+] Using short-term credential mechanism")
+            print(f"[+] HMAC key (password): {auth_password}")
+            print(f"[+] HMAC key (bytes): {integrity_key.hex()}")
+            
+            attrs = [
+                stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (UDP=17)
+            ]
+            
+            # 根据 RFC 8489 Section 9.1.2，默认情况下必须同时包含 MESSAGE-INTEGRITY-SHA256 和 MESSAGE-INTEGRITY
+            tid = gen_tid()
+            req = build_msg_with_short_term_credential(STUN_ALLOCATE_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+            control_sock.send(req)
+            
+            try:
+                data = control_sock.recv(2000)
+                msg_type, tid, resp_attrs = parse_attrs(data)
+                print("[+] Allocate response attrs:", resp_attrs)
+            except socket.timeout:
+                print("[-] Timeout waiting for response")
+                control_sock.close()
+                return None
+            
+            # 检查响应状态
+            if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                print("[+] TCP+UDP TURN allocation successful")
+                
+                # 检测服务器在响应中使用的算法类型（用于后续请求，RFC 8489 Section 9.1.5）
+                has_sha256 = STUN_ATTR_MESSAGE_INTEGRITY_SHA256 in resp_attrs
+                has_sha1 = STUN_ATTR_MESSAGE_INTEGRITY in resp_attrs
+                
+                if has_sha256:
+                    mi_algorithm = 'sha256'
+                    print(f"[+] Server uses MESSAGE-INTEGRITY-SHA256, subsequent requests will use SHA256 only (RFC 8489 Section 9.1.5)")
+                elif has_sha1:
+                    mi_algorithm = 'sha1'
+                    print(f"[+] Server uses MESSAGE-INTEGRITY, subsequent requests will use SHA1 only (RFC 8489 Section 9.1.5)")
+                else:
+                    mi_algorithm = 'both'  # 默认
+                    print(f"[!] Warning: No MI attribute in response, using method: {mi_algorithm}")
+                
+                # 根据 RFC 8489 Section 9.1.4，验证响应中的消息完整性
+                is_valid, verified_algorithm = verify_short_term_response_integrity(data, integrity_key, expected_algorithm='both')
+                if not is_valid:
+                    print("[!] Response integrity verification failed per RFC 8489 Section 9.1.4")
+                    # 根据 RFC 8489 Section 9.1.4，对于可靠传输，立即结束事务并报告完整性保护违规
+                    print("[!] Ending transaction (reliable transport) - integrity protection violated")
+                    control_sock.close()
+                    return None
+                
+                if verified_algorithm and verified_algorithm != mi_algorithm:
+                    mi_algorithm = verified_algorithm
+                
+                nonce = None
+                server_realm = None
+                return control_sock, nonce, server_realm, integrity_key, server_address, mi_algorithm
+            elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                error_code = resp_attrs.get(STUN_ATTR_ERROR_CODE)
+                if error_code:
                     error_class = error_code[2]
                     error_number = error_code[3]
-                    if error_class == 4 and error_number == 1:  # 401 Unauthorized
-                        is_unauthorized = True
-                # 也检查文本形式的错误
-                if b"Unauthorized" in error_code or b"401" in error_code:
-                    is_unauthorized = True
-            
-            if is_unauthorized:
-                print("[+] Got nonce and realm for authentication")
-                nonce = attrs.get(21)
-                server_realm = attrs.get(20)
-                
-                if nonce and server_realm:
-                    print(f"[+] Got nonce={nonce}, realm={server_realm}")
-                    
-                    # 计算完整性密钥
-                    key_str = f"{auth_username}:{server_realm.decode()}:{auth_password}"
-                    print(f"[+] HMAC key string: {key_str}")
-                    integrity_key = hashlib.md5(key_str.encode()).digest()
-                    print(f"[+] HMAC key: {integrity_key.hex()}")
-                    
-                    # 第二次分配请求（带认证）
-                    tid2 = gen_tid()
-                    attrs2 = [
-                        stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
-                        stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
-                        stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
-                        stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (UDP=17)
-                    ]
-
-                    req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
-                    control_sock.send(req2)
-                    
-                    # 接收第二次响应
-                    data = control_sock.recv(2000)
-                    msg_type, tid, attrs = parse_attrs(data)
-                    print("[+] Final TCP+UDP resp attrs:", attrs)
-                    
-                    # 检查是否成功
-                    if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
-                        print("[+] TCP+UDP TURN allocation successful")
-                        return control_sock, nonce, server_realm, integrity_key, server_address
-                    elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
-                        error_code = attrs.get(9)
-                        if error_code:
-                            # 解析错误代码
-                            if len(error_code) >= 4:
-                                error_class = error_code[2]
-                                error_number = error_code[3]
-                                error_text = error_code[4:].decode('utf-8', errors='ignore')
-                                print(f"[-] TCP+UDP TURN allocation failed: Error response")
-                                print(f"[-] Error: {error_class}{error_number:02d} {error_text}")
-                            else:
-                                error_text = error_code[3:].decode('utf-8', errors='ignore')
-                                print(f"[-] TCP+UDP TURN allocation failed: Error response")
-                                print(f"[-] Error: {error_text}")
-                        control_sock.close()
-                        return None
-                    else:
-                        print(f"[-] Unexpected response type: 0x{msg_type:04x}")
-                        control_sock.close()
-                        return None
-                else:
-                    print("[-] Missing nonce or realm in response")
-                    control_sock.close()
-                    return None
-            elif error_code and b"Try Alternate" in error_code:
-                print("[+] Got Try Alternate response")
-                # 解析ALTERNATE-SERVER属性
-                alt_server = attrs.get(0x8023)  # ALTERNATE-SERVER
-                if alt_server:
-                    alt_addr = parse_alternate_server(alt_server)
-                    if alt_addr:
-                        print(f"[+] Trying alternate server: {alt_addr}")
-                        control_sock.close()
-                        # 递归尝试备用服务器
-                        return allocate_tcp_udp_single_server(alt_addr, username, password, realm, use_tls, server_hostname)
-                    else:
-                        print("[-] Failed to parse alternate server address")
-                else:
-                    print("[+] No alternate server provided")
-                    control_sock.close()
-                    return None
+                    error_reason = error_code[4:].decode('utf-8', errors='ignore')
+                    print(f"[-] Error: {error_class}{error_number:02d} {error_reason}")
+                print("[-] TCP+UDP TURN allocation failed")
+                control_sock.close()
+                return None
             else:
-                print("[-] Unexpected error response")
+                print(f"[-] Unexpected response type: 0x{msg_type:04x}")
                 control_sock.close()
                 return None
         else:
-            print(f"[-] Unexpected response type: 0x{msg_type:04x}")
-            control_sock.close()
-            return None
+            # 长期凭证：先发送无认证请求获取nonce和realm
+            # 第一次分配请求（无认证）
+            tid1 = gen_tid()
+            attrs1 = [
+                stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (UDP=17)
+            ]
+            
+            req1 = build_msg(STUN_ALLOCATE_REQUEST, tid1, attrs1, None, add_fingerprint=False)
+            control_sock.send(req1)
+            
+            # 接收第一次响应
+            data = control_sock.recv(2000)
+            msg_type, tid, attrs = parse_attrs(data)
+            print("[+] First TCP+UDP resp attrs:", attrs)
+            
+            # 检查响应类型
+            if msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                # 检查错误代码
+                error_code = attrs.get(9)
+                # 检查是否是401 Unauthorized错误
+                is_unauthorized = False
+                if error_code:
+                    # 检查错误代码格式: 前2字节是错误类，第3字节是错误号
+                    if len(error_code) >= 4:
+                        error_class = error_code[2]
+                        error_number = error_code[3]
+                        if error_class == 4 and error_number == 1:  # 401 Unauthorized
+                            is_unauthorized = True
+                    # 也检查文本形式的错误
+                    if b"Unauthorized" in error_code or b"401" in error_code:
+                        is_unauthorized = True
+                
+                if is_unauthorized:
+                    print("[+] Got nonce and realm for authentication")
+                    nonce = attrs.get(21)
+                    server_realm = attrs.get(20)
+                    
+                    if nonce and server_realm:
+                        print(f"[+] Got nonce={nonce}, realm={server_realm}")
+                        
+                        # 计算完整性密钥
+                        key_str = f"{auth_username}:{server_realm.decode()}:{auth_password}"
+                        print(f"[+] HMAC key string: {key_str}")
+                        integrity_key = hashlib.md5(key_str.encode()).digest()
+                        print(f"[+] HMAC key: {integrity_key.hex()}")
+                        
+                        # 第二次分配请求（带认证）
+                        tid2 = gen_tid()
+                        attrs2 = [
+                            stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),   # USERNAME
+                            stun_attr(STUN_ATTR_REALM, server_realm),              # REALM
+                            stun_attr(STUN_ATTR_NONCE, nonce),              # NONCE
+                            stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00")),  # REQUESTED-TRANSPORT (UDP=17)
+                        ]
+
+                        req2 = build_msg(STUN_ALLOCATE_REQUEST, tid2, attrs2, integrity_key, add_fingerprint=True)
+                        control_sock.send(req2)
+                        
+                        # 接收第二次响应
+                        data = control_sock.recv(2000)
+                        msg_type, tid, attrs = parse_attrs(data)
+                        print("[+] Final TCP+UDP resp attrs:", attrs)
+                    
+                        # 检查是否成功
+                        if msg_type == STUN_ALLOCATE_SUCCESS_RESPONSE:
+                            print("[+] TCP+UDP TURN allocation successful")
+                            return control_sock, nonce, server_realm, integrity_key, server_address
+                        elif msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                            error_code = attrs.get(9)
+                            if error_code:
+                                # 解析错误代码
+                                if len(error_code) >= 4:
+                                    error_class = error_code[2]
+                                    error_number = error_code[3]
+                                    error_text = error_code[4:].decode('utf-8', errors='ignore')
+                                    print(f"[-] TCP+UDP TURN allocation failed: Error response")
+                                    print(f"[-] Error: {error_class}{error_number:02d} {error_text}")
+                                else:
+                                    error_text = error_code[3:].decode('utf-8', errors='ignore')
+                                    print(f"[-] TCP+UDP TURN allocation failed: Error response")
+                                    print(f"[-] Error: {error_text}")
+                            control_sock.close()
+                            return None
+                        else:
+                            print(f"[-] Unexpected response type: 0x{msg_type:04x}")
+                            control_sock.close()
+                            return None
+                    else:
+                        print("[-] Missing nonce or realm in response")
+                        control_sock.close()
+                        return None
+                elif error_code and b"Try Alternate" in error_code:
+                    print("[+] Got Try Alternate response")
+                    # 解析ALTERNATE-SERVER属性
+                    alt_server = attrs.get(0x8023)  # ALTERNATE-SERVER
+                    if alt_server:
+                        alt_addr = parse_alternate_server(alt_server)
+                        if alt_addr:
+                            print(f"[+] Trying alternate server: {alt_addr}")
+                            control_sock.close()
+                            # 递归尝试备用服务器
+                            return allocate_tcp_udp_single_server(alt_addr, username, password, realm, use_tls, server_hostname, use_short_term_credential)
+                        else:
+                            print("[-] Failed to parse alternate server address")
+                    else:
+                        print("[+] No alternate server provided")
+                    control_sock.close()
+                    return None
+                else:
+                    print("[-] Unexpected error response")
+                    control_sock.close()
+                    return None
+            else:
+                print(f"[-] Unexpected response type: 0x{msg_type:04x}")
+                control_sock.close()
+                return None
         
     except Exception as e:
         print(f"[-] TCP+UDP allocation failed: {e}")
@@ -799,8 +1926,18 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
         return None
 
 
-def allocate_tcp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None):
-    """分配TCP TURN中继地址，支持多IP备选和自动重试"""
+def allocate_tcp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False):
+    """分配TCP TURN中继地址，支持多IP备选和自动重试
+    
+    Args:
+        server_address: TURN服务器地址 (ip, port)
+        username: 用户名
+        password: 密码
+        realm: 认证域（长期凭证需要）
+        use_tls: 是否使用TLS
+        server_hostname: 服务器主机名（用于DNS发现）
+        use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+    """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
     
@@ -819,7 +1956,7 @@ def allocate_tcp(server_address=None, username=None, password=None, realm=None, 
         current_address = (ip, server_port)
         print(f"[+] TCP Attempt {i+1}/{len(server_ips)}: Trying {current_address}")
         
-        result = allocate_tcp_single_server(current_address, username, password, realm, use_tls)
+        result = allocate_tcp_single_server(current_address, username, password, realm, use_tls, use_short_term_credential)
         if result:
             print(f"[+] Successfully allocated TCP on {current_address}")
             return result
@@ -829,8 +1966,14 @@ def allocate_tcp(server_address=None, username=None, password=None, realm=None, 
     print("[-] All TCP IP addresses failed")
     return None
 
-def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, server_address=None, username=None):
-    """创建权限，允许向指定对等方发送数据"""
+def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, server_address=None, username=None, mi_algorithm=None):
+    """创建权限，允许向指定对等方发送数据
+    
+    Args:
+        mi_algorithm: 消息完整性算法类型 ('sha256', 'sha1', 'both', 或 None)
+                      对于短期凭证，必须与服务器在初始响应中使用的算法匹配
+                      对于长期凭证，应为 None（使用默认的 build_msg）
+    """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
         
@@ -858,12 +2001,27 @@ def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, ser
     tid = gen_tid()
     attrs = [
         stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
-        stun_attr(STUN_ATTR_REALM, realm),
-        stun_attr(STUN_ATTR_NONCE, nonce),
-        stun_attr(STUN_ATTR_XOR_PEER_ADDRESS, xor_addr),
     ]
     
-    req = build_msg(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    # 短期凭证不需要 REALM 和 NONCE
+    if realm is not None:
+        attrs.append(stun_attr(STUN_ATTR_REALM, realm))
+    if nonce is not None:
+        attrs.append(stun_attr(STUN_ATTR_NONCE, nonce))
+    
+    attrs.append(stun_attr(STUN_ATTR_XOR_PEER_ADDRESS, xor_addr))
+    
+    # 短期凭证（nonce 和 realm 为 None）必须使用服务器在初始响应中使用的算法
+    if nonce is None and realm is None:
+        if mi_algorithm == 'sha256':
+            req = build_msg_with_short_term_credential_sha256_only(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        elif mi_algorithm == 'sha1':
+            req = build_msg_with_short_term_credential_sha1_only(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        else:
+            # 默认使用 both（仅在初始请求时）
+            req = build_msg_with_short_term_credential(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    else:
+        req = build_msg(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
     
     # 检查是否为SSL套接字（更准确的检测方法）
     if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
@@ -889,8 +2047,14 @@ def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, ser
     
     return True
 
-def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, server_address=None, username=None):
-    """绑定通道号到对等方地址"""
+def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, server_address=None, username=None, mi_algorithm=None):
+    """绑定通道号到对等方地址
+    
+    Args:
+        mi_algorithm: 消息完整性算法类型 ('sha256', 'sha1', 'both', 或 None)
+                      对于短期凭证，必须与服务器在初始响应中使用的算法匹配
+                      对于长期凭证，应为 None（使用默认的 build_msg）
+    """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
         
@@ -917,13 +2081,30 @@ def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_
     tid = gen_tid()
     attrs = [
         stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
-        stun_attr(STUN_ATTR_REALM, realm),
-        stun_attr(STUN_ATTR_NONCE, nonce),
-        stun_attr(STUN_ATTR_CHANNEL_NUMBER, struct.pack("!HH", channel_number, 0)),
-        stun_attr(STUN_ATTR_XOR_PEER_ADDRESS, xor_addr),
     ]
     
-    req = build_msg(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    # 短期凭证不需要 REALM 和 NONCE
+    if realm is not None:
+        attrs.append(stun_attr(STUN_ATTR_REALM, realm))
+    if nonce is not None:
+        attrs.append(stun_attr(STUN_ATTR_NONCE, nonce))
+    
+    attrs.extend([
+        stun_attr(STUN_ATTR_CHANNEL_NUMBER, struct.pack("!HH", channel_number, 0)),
+        stun_attr(STUN_ATTR_XOR_PEER_ADDRESS, xor_addr),
+    ])
+    
+    # 短期凭证（nonce 和 realm 为 None）必须使用服务器在初始响应中使用的算法
+    if nonce is None and realm is None:
+        if mi_algorithm == 'sha256':
+            req = build_msg_with_short_term_credential_sha256_only(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        elif mi_algorithm == 'sha1':
+            req = build_msg_with_short_term_credential_sha1_only(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        else:
+            # 默认使用 both（仅在初始请求时）
+            req = build_msg_with_short_term_credential(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    else:
+        req = build_msg(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
     
     # 检查是否为SSL套接字（更准确的检测方法）
     if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
@@ -982,8 +2163,14 @@ def channel_data(sock, channel_number, data, server_address=None):
     
     return True
 
-def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, username=None):
-    """发起TCP连接到对等方 (RFC 6062 Connect请求)"""
+def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, username=None, mi_algorithm=None):
+    """发起TCP连接到对等方 (RFC 6062 Connect请求)
+    
+    Args:
+        mi_algorithm: 消息完整性算法类型 ('sha256', 'sha1', 'both', 或 None)
+                      对于短期凭证，必须与服务器在初始响应中使用的算法匹配
+                      对于长期凭证，应为 None（使用默认的 build_msg）
+    """
     print(f"[+] Initiating TCP connection to {peer_ip}:{peer_port}")
     
     # 解析对等方地址（支持域名）
@@ -1008,12 +2195,27 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
     
     attrs = [
         stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
-        stun_attr(STUN_ATTR_REALM, realm),
-        stun_attr(STUN_ATTR_NONCE, nonce),
-        stun_attr(STUN_ATTR_XOR_PEER_ADDRESS, xor_addr),
     ]
     
-    req = build_msg(STUN_CONNECT_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    # 短期凭证不需要 REALM 和 NONCE
+    if realm is not None:
+        attrs.append(stun_attr(STUN_ATTR_REALM, realm))
+    if nonce is not None:
+        attrs.append(stun_attr(STUN_ATTR_NONCE, nonce))
+    
+    attrs.append(stun_attr(STUN_ATTR_XOR_PEER_ADDRESS, xor_addr))
+    
+    # 短期凭证（nonce 和 realm 为 None）必须使用服务器在初始响应中使用的算法
+    if nonce is None and realm is None:
+        if mi_algorithm == 'sha256':
+            req = build_msg_with_short_term_credential_sha256_only(STUN_CONNECT_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        elif mi_algorithm == 'sha1':
+            req = build_msg_with_short_term_credential_sha1_only(STUN_CONNECT_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        else:
+            # 默认使用 both（仅在初始请求时）
+            req = build_msg_with_short_term_credential(STUN_CONNECT_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    else:
+        req = build_msg(STUN_CONNECT_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
     control_sock.send(req)
     
     # 接收Connect响应
@@ -1052,8 +2254,14 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
         print("[-] Response attributes keys:", list(attrs.keys()))
         return None
 
-def tcp_connection_bind(control_sock, nonce, realm, integrity_key, connection_id, server_address=None, username=None):
-    """绑定客户端数据连接到对等方连接 (RFC 6062 ConnectionBind请求)"""
+def tcp_connection_bind(control_sock, nonce, realm, integrity_key, connection_id, server_address=None, username=None, mi_algorithm=None):
+    """绑定客户端数据连接到对等方连接 (RFC 6062 ConnectionBind请求)
+    
+    Args:
+        mi_algorithm: 消息完整性算法类型 ('sha256', 'sha1', 'both', 或 None)
+                      对于短期凭证，必须与服务器在初始响应中使用的算法匹配
+                      对于长期凭证，应为 None（使用默认的 build_msg）
+    """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
         
@@ -1065,12 +2273,27 @@ def tcp_connection_bind(control_sock, nonce, realm, integrity_key, connection_id
     tid = gen_tid()
     attrs = [
         stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
-        stun_attr(STUN_ATTR_REALM, realm),
-        stun_attr(STUN_ATTR_NONCE, nonce),
-        stun_attr(STUN_ATTR_CONNECTION_ID, struct.pack("!I", connection_id)),
     ]
     
-    req = build_msg(STUN_CONNECTION_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    # 短期凭证不需要 REALM 和 NONCE
+    if realm is not None:
+        attrs.append(stun_attr(STUN_ATTR_REALM, realm))
+    if nonce is not None:
+        attrs.append(stun_attr(STUN_ATTR_NONCE, nonce))
+    
+    attrs.append(stun_attr(STUN_ATTR_CONNECTION_ID, struct.pack("!I", connection_id)))
+    
+    # 短期凭证（nonce 和 realm 为 None）必须使用服务器在初始响应中使用的算法
+    if nonce is None and realm is None:
+        if mi_algorithm == 'sha256':
+            req = build_msg_with_short_term_credential_sha256_only(STUN_CONNECTION_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        elif mi_algorithm == 'sha1':
+            req = build_msg_with_short_term_credential_sha1_only(STUN_CONNECTION_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+        else:
+            # 默认使用 both（仅在初始请求时）
+            req = build_msg_with_short_term_credential(STUN_CONNECTION_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    else:
+        req = build_msg(STUN_CONNECTION_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
     control_sock.send(req)
     
     # 接收ConnectionBind响应

@@ -9,7 +9,7 @@ import os
 # OpenRouter API 配置
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # 如果环境变量未设置，可以在这里直接设置（不推荐，建议使用环境变量）
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 

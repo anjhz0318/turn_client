@@ -17,7 +17,7 @@ import queue
 # 导入TURN相关模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'turn_utils'))
 from turn_server_discovery import TURNServerDiscovery
-from test_turn_capabilities import test_udp_turn, test_tcp_udp_turn, test_tcp_turn
+from test_turn_capabilities import test_udp_turn, test_tcp_udp_turn, test_tcp_turn, allocate_tcp_with_fallback
 from turn_client import allocate_tcp, tcp_connect, create_permission
 
 class ComprehensiveTURNTester:
@@ -25,7 +25,8 @@ class ComprehensiveTURNTester:
     
     def __init__(self, turn_server: str, turn_port: int, username: str, 
                  password: str, realm: str = None, use_tls: bool = False,
-                 output_file: str = "turn_test_results.json", reuse_connection: bool = True):
+                 output_file: str = "turn_test_results.json", reuse_connection: bool = True,
+                 use_short_term_credential: bool = False):
         self.turn_server = turn_server
         self.turn_port = turn_port
         self.username = username
@@ -34,6 +35,7 @@ class ComprehensiveTURNTester:
         self.use_tls = use_tls
         self.output_file = output_file
         self.reuse_connection = reuse_connection
+        self.use_short_term_credential = use_short_term_credential
         
         # 初始化发现工具
         self.discovery = TURNServerDiscovery()
@@ -49,7 +51,7 @@ class ComprehensiveTURNTester:
     def _load_test_ips(self) -> List[str]:
         """加载测试IP列表"""
         try:
-            with open('standard_test_ips.txt', 'r') as f:
+            with open('standard_test_ips.txt', 'r',encoding="utf-8") as f:
                 return [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
         except FileNotFoundError:
             print("[-] standard_test_ips.txt not found, using default IPs")
@@ -58,7 +60,7 @@ class ComprehensiveTURNTester:
     def _load_test_ports(self) -> List[int]:
         """加载测试端口列表"""
         try:
-            with open('standard_test_ports.txt', 'r') as f:
+            with open('standard_test_ports.txt', 'r',encoding="utf-8") as f:
                 return [int(line.strip()) for line in f if line.strip() and not line.strip().startswith('#')]
         except FileNotFoundError:
             print("[-] standard_test_ports.txt not found, using default ports")
@@ -138,42 +140,42 @@ class ComprehensiveTURNTester:
         server_address = (server_ip, self.turn_port)
         capabilities = {}
         
-        # 测试UDP
+        # 测试UDP（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
         print("  [1/3] 测试UDP TURN...")
         try:
             test_ip = "8.8.8.8"
             test_port = 53
             result = test_udp_turn(
                 server_address, self.username, self.password, 
-                self.realm, self.turn_server, test_ip, test_port
+                self.realm, self.turn_server, test_ip, test_port, False
             )
             capabilities['udp'] = result
         except Exception as e:
             print(f"  [-] UDP测试失败: {e}")
             capabilities['udp'] = False
         
-        # 测试TCP+UDP
+        # 测试TCP+UDP（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
         print("  [2/3] 测试TCP+UDP TURN...")
         try:
             test_ip = "8.8.8.8"
             test_port = 53
             result = test_tcp_udp_turn(
                 server_address, self.username, self.password, 
-                self.realm, self.turn_server, self.use_tls, test_ip, test_port
+                self.realm, self.turn_server, self.use_tls, test_ip, test_port, False
             )
             capabilities['tcp_udp'] = result
         except Exception as e:
             print(f"  [-] TCP+UDP测试失败: {e}")
             capabilities['tcp_udp'] = False
         
-        # 测试TCP
+        # 测试TCP（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
         print("  [3/3] 测试TCP TURN...")
         try:
             test_ip = "httpbin.org"
             test_port = 80
             result = test_tcp_turn(
                 server_address, self.username, self.password, 
-                self.realm, self.turn_server, self.use_tls, test_ip, test_port
+                self.realm, self.turn_server, self.use_tls, test_ip, test_port, False
             )
             capabilities['tcp'] = result
         except Exception as e:
@@ -217,13 +219,13 @@ class ComprehensiveTURNTester:
         control_sock = None
         
         try:
-            # 如果复用连接，先建立TURN连接
+            # 如果复用连接，先建立TURN连接（使用回退机制）
             if reuse_connection:
                 print(f"  [*] 建立TURN连接（复用模式）...")
                 server_address = (server_ip, self.turn_port)
-                allocation_result = allocate_tcp(
+                allocation_result, is_short_term = allocate_tcp_with_fallback(
                     server_address, self.username, self.password, 
-                    self.realm, self.use_tls, self.turn_server
+                    self.realm, self.use_tls
                 )
                 
                 if not allocation_result:
@@ -232,7 +234,11 @@ class ComprehensiveTURNTester:
                     self._save_results()
                     return
                 
-                control_sock, nonce, realm, integrity_key, actual_server = allocation_result
+                control_sock, nonce, realm, integrity_key, actual_server, *extra = allocation_result
+                if len(extra) > 0:
+                    mi_algorithm = extra[0]  # 可能存在 mi_algorithm
+                if is_short_term:
+                    print(f"  [+] 使用短期凭据建立TURN连接")
                 print(f"  [+] TURN连接已建立，将测试 {len(self.test_ports)} 个端口")
             
             # 测试所有端口
@@ -284,21 +290,23 @@ class ComprehensiveTURNTester:
         should_close_connection = False
         
         try:
-            # 如果没有提供复用的连接，则创建新连接
+            # 如果没有提供复用的连接，则创建新连接（使用回退机制）
             if control_sock is None:
                 server_address = (server_ip, self.turn_port)
                 
-                # 分配TCP TURN
-                allocation_result = allocate_tcp(
+                # 分配TCP TURN（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
+                allocation_result, is_short_term = allocate_tcp_with_fallback(
                     server_address, self.username, self.password, 
-                    self.realm, self.use_tls, self.turn_server
+                    self.realm, self.use_tls
                 )
                 
                 if not allocation_result:
                     result['error'] = 'Allocation failed'
                     return result
                 
-                control_sock, nonce, realm, integrity_key, actual_server = allocation_result
+                control_sock, nonce, realm, integrity_key, actual_server, *extra = allocation_result
+                if len(extra) > 0:
+                    mi_algorithm = extra[0]  # 可能存在 mi_algorithm
                 should_close_connection = True
             
             # 创建权限
@@ -455,11 +463,19 @@ def main():
     parser.add_argument('--threads', type=int, default=4, help='线程数')
     parser.add_argument('--reuse-connection', action='store_true', help='复用控制连接（为每个IP建立一次连接，测试所有端口）')
     parser.add_argument('--no-reuse-connection', action='store_true', help='为每个端口建立新连接')
+    parser.add_argument('--short-term-credential', action='store_true', 
+                       help='已弃用：现在自动使用回退机制（先尝试长期凭据，如果400错误则回退为短期凭据）')
     
     args = parser.parse_args()
     
     # 确定连接复用模式
     reuse_connection = args.reuse_connection if not args.no_reuse_connection else False
+    
+    # 如果用户指定了 --short-term-credential，给出提示
+    if args.short_term_credential:
+        print("[!] 注意：--short-term-credential 参数已弃用")
+        print("[!] 现在会自动使用回退机制：先尝试长期凭据，如果收到400错误则回退为短期凭据")
+        print()
     
     tester = ComprehensiveTURNTester(
         turn_server=args.turn_server,
@@ -469,7 +485,8 @@ def main():
         realm=args.realm,
         use_tls=args.tls,
         output_file=args.output,
-        reuse_connection=reuse_connection
+        reuse_connection=reuse_connection,
+        use_short_term_credential=False  # 不再使用此参数，总是使用回退机制
     )
     
     try:

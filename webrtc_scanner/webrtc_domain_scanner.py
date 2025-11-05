@@ -328,8 +328,8 @@ URL: {page_content['url']}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/turn-client",
-        "X-Title": "WebRTC Domain Scanner"
+        "HTTP-Referer": "https://github.com/turn-client",  # OpenRouter API 要求的头部
+        "X-Title": "WebRTC Domain Scanner"  # OpenRouter API 要求的头部
     }
     
     payload = {
@@ -555,8 +555,8 @@ URL: {page_content['url']}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/turn-client",
-        "X-Title": "WebRTC Domain Scanner"
+        "HTTP-Referer": "https://github.com/turn-client",  # OpenRouter API 要求的头部
+        "X-Title": "WebRTC Domain Scanner"  # OpenRouter API 要求的头部
     }
     
     payload = {
