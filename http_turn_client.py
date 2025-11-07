@@ -8,10 +8,15 @@ import socket
 import ssl
 import argparse
 import sys
+import os
 from turn_utils import (
     allocate_tcp, tcp_connection_bind, tcp_send_data, tcp_receive_data,
     resolve_server_address, resolve_peer_address, tcp_connect
 )
+# 导入回退机制函数和权限创建函数（参考 comprehensive_turn_tester）
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'turn_utils'))
+from test_turn_capabilities import allocate_tcp_with_fallback
+from turn_client import create_permission
 from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
 
 class HTTPTURNClient:
@@ -46,25 +51,42 @@ class HTTPTURNClient:
         print(f"[+] Using TURN server: {server_address}")
         
         try:
-            # 1. 分配TCP TURN中继地址
-            result = allocate_tcp(server_address, self.username, self.password, self.realm, self.use_tls)
-            if not result:
+            # 1. 分配TCP TURN中继地址（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
+            allocation_result, is_short_term = allocate_tcp_with_fallback(
+                server_address, self.username, self.password, self.realm, self.use_tls
+            )
+            if not allocation_result:
                 print("[-] Failed to allocate TCP TURN relay")
                 return False
-                
-            self.control_sock, nonce, realm, integrity_key, actual_server_address = result
-            print("[+] TCP TURN allocation successful")
             
-            # 2. 发起TCP连接到对等方
+            self.control_sock, nonce, realm, integrity_key, actual_server_address, *extra = allocation_result
+            mi_algorithm = extra[0] if len(extra) > 0 else None  # 可能存在 mi_algorithm
+            
+            if is_short_term:
+                print("[+] TCP TURN allocation successful (using short-term credential)")
+            else:
+                print("[+] TCP TURN allocation successful (using long-term credential)")
+            
+            # 2. 解析对等方IP地址
             peer_ip = resolve_peer_address(self.target_host)
             if not peer_ip:
                 print(f"[-] Failed to resolve peer {self.target_host}")
                 self.control_sock.close()
                 return False
                 
-            print(f"[+] Initiating TCP connection to {self.target_host}:{self.target_port}")
             print(f"[+] Resolved peer {self.target_host} to {peer_ip}")
             
+            # 3. 创建权限（参考 comprehensive_turn_tester 的处理方式）
+            if not create_permission(
+                self.control_sock, nonce, realm, integrity_key,
+                peer_ip, self.target_port, actual_server_address, self.username, mi_algorithm
+            ):
+                print("[-] Failed to create permission")
+                self.control_sock.close()
+                return False
+            
+            # 4. 发起TCP连接到对等方
+            print(f"[+] Initiating TCP connection to {self.target_host}:{self.target_port}")
             connection_id = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.target_port, self.username)
             if not connection_id:
                 print("[-] Failed to initiate TCP connection")
@@ -73,13 +95,13 @@ class HTTPTURNClient:
                 
             print(f"[+] Got connection ID: {connection_id}")
             
-            # 3. 建立数据连接
+            # 5. 建立数据连接
             self.data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_sock.settimeout(10)
             self.data_sock.connect(actual_server_address)
             print("[+] Data connection established")
             
-            # 4. 绑定数据连接到对等方连接
+            # 6. 绑定数据连接到对等方连接
             if not tcp_connection_bind(self.data_sock, nonce, realm, integrity_key, connection_id, actual_server_address, self.username):
                 print("[-] Failed to bind data connection")
                 self.data_sock.close()
@@ -88,7 +110,7 @@ class HTTPTURNClient:
                 
             print("[+] Data connection bound successfully")
             
-            # 5. 如果是HTTPS，建立SSL连接
+            # 7. 如果是HTTPS，建立SSL连接
             if self.use_https:
                 print("[+] Establishing SSL/TLS connection...")
                 try:

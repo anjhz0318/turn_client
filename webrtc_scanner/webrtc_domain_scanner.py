@@ -30,9 +30,17 @@ from domain_scanner_config import (
     REQUEST_HEADERS,
     AI_TEMPERATURE,
     AI_STREAM_TIMEOUT,
-    RESULTS_FILE,
+    RESULTS_FILE_PREFIX,
+    RESULTS_FILE_SUFFIX,
     PROGRESS_FILE,
+    BATCH_SIZE,
     validate_config
+)
+
+# 导入页面元素提取器
+from page_element_extractor import (
+    fetch_and_extract_elements,
+    format_elements_for_ai
 )
 
 # 全局变量用于优雅退出
@@ -73,7 +81,7 @@ def read_domains(csv_file: str, start_line: Optional[int] = None, max_domains: O
         max_domains: 最多读取多少个域名
         
     Returns:
-        域名列表，每个元素包含 rank 和 domain
+        域名列表，每个元素包含 rank、domain 和 line（实际行号）
     """
     domains = []
     with open(csv_file, 'r', encoding='utf-8') as f:
@@ -87,7 +95,8 @@ def read_domains(csv_file: str, start_line: Optional[int] = None, max_domains: O
                 if domain:
                     domains.append({
                         "rank": rank,
-                        "domain": domain
+                        "domain": domain,
+                        "line": line_num  # 记录实际行号
                     })
                     if max_domains and len(domains) >= max_domains:
                         break
@@ -230,13 +239,13 @@ def extract_title(content: str) -> str:
     return ""
 
 
-def analyze_webrtc_with_ai(domain: str, page_content: Dict, api_key: str, model: str) -> Optional[Dict]:
+def analyze_webrtc_with_ai(domain: str, elements_data: Dict, api_key: str, model: str) -> Optional[Dict]:
     """
-    使用 AI 模型分析页面内容，判断是否包含 WebRTC 相关服务
+    使用 AI 模型分析页面元素，判断是否包含 WebRTC 相关服务
     
     Args:
         domain: 域名
-        page_content: 页面内容字典
+        elements_data: 包含提取元素的页面数据字典
         api_key: OpenRouter API Key
         model: 模型名称
         
@@ -247,16 +256,18 @@ def analyze_webrtc_with_ai(domain: str, page_content: Dict, api_key: str, model:
         print("[!] 错误: 未设置 OPENROUTER_API_KEY")
         return None
     
-    # 清理页面内容，确保编码正确
-    content = page_content.get('content', '')
-    title = page_content.get('title', '')
+    # 格式化元素信息用于 AI 分析
+    elements_text = format_elements_for_ai(elements_data)
+    elements_text_length = len(elements_text)
+    print(f"[*] 提取的元素信息长度: {elements_text_length} 字符")
+    title = elements_data.get('title', '')
     
     # 确保所有字符串都是有效的 UTF-8
-    if not isinstance(content, str):
+    if not isinstance(elements_text, str):
         try:
-            content = str(content, encoding='utf-8', errors='replace')
+            elements_text = str(elements_text, encoding='utf-8', errors='replace')
         except:
-            content = str(content)
+            elements_text = str(elements_text)
     
     if not isinstance(title, str):
         try:
@@ -264,16 +275,12 @@ def analyze_webrtc_with_ai(domain: str, page_content: Dict, api_key: str, model:
         except:
             title = str(title)
     
-    # 限制内容长度，避免超出 API 限制
-    if len(content) > DEFAULT_MAX_CONTENT_LENGTH:
-        content = content[:DEFAULT_MAX_CONTENT_LENGTH]
-    
     # 构建提示词
     prompt = f"""
-你是一名精通前端与实时通信技术的分析专家。现在我将提供一个网站主页的 HTML 源码，请你判断该网站是否使用了 WebRTC（Web Real-Time Communication） 技术。
+你是一名精通前端与实时通信技术的分析专家。现在我将提供一个网站主页的页面元素信息（包括按钮、链接、输入框的文本和属性），请你判断该网站是否使用了 WebRTC（Web Real-Time Communication） 技术。
 请你从 网站业务语义 进行分析，并按以下步骤输出结果。
 
-从页面的标题、描述，响应体内容的文字、注释或脚本变量命名中，推断网站的业务类型。
+从页面的标题、按钮文本、链接文本、输入框的 placeholder 或 value 等元素中，推断网站的业务类型。
 若网站功能与以下任意场景相关，则可能使用 WebRTC：
 
 （1）视频通信类场景
@@ -296,7 +303,7 @@ def analyze_webrtc_with_ai(domain: str, page_content: Dict, api_key: str, model:
 
 实时直播、低延迟推流、互动直播、视频客服、虚拟前台、远程展示、实时媒体播放
 
-若源码中出现这些功能描述或提示性词汇，可判定该网站具备 WebRTC 通信能力。
+若页面元素中出现这些功能描述或提示性词汇，可判定该网站具备 WebRTC 通信能力。
 
 3. 输出格式
 
@@ -308,16 +315,16 @@ def analyze_webrtc_with_ai(domain: str, page_content: Dict, api_key: str, model:
 }}
 
 
-以下是网站 HTML 源码
+以下是网站页面元素信息
 
 域名: {domain}
-URL: {page_content['url']}
-状态码: {page_content['status_code']}
-内容类型: {page_content['content_type']}
+URL: {elements_data['url']}
+状态码: {elements_data['status_code']}
+内容类型: {elements_data['content_type']}
 标题: {title}
 
-页面内容:
-{content}
+页面元素信息:
+{elements_text}
 
 """
     
@@ -327,9 +334,7 @@ URL: {page_content['url']}
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/turn-client",  # OpenRouter API 要求的头部
-        "X-Title": "WebRTC Domain Scanner"  # OpenRouter API 要求的头部
+        "Content-Type": "application/json"
     }
     
     payload = {
@@ -340,7 +345,7 @@ URL: {page_content['url']}
                 "content": prompt
             }
         ],
-        "stream": True,
+        "stream": False,  # 使用非流式响应
         "temperature": AI_TEMPERATURE
     }
     
@@ -349,7 +354,6 @@ URL: {page_content['url']}
             OPENROUTER_API_URL,
             headers=headers,
             json=payload,
-            stream=True,
             timeout=AI_STREAM_TIMEOUT
         )
         
@@ -357,353 +361,136 @@ URL: {page_content['url']}
         if response.status_code != 200:
             try:
                 error_data = response.json()
-                print(f"[!] API 错误: {error_data.get('error', {}).get('message', 'Unknown error')}")
+                error_msg = error_data.get('error', {})
+                if isinstance(error_msg, dict):
+                    error_msg = error_msg.get('message', str(error_msg))
+                print(f"[!] API 错误: {error_msg}")
             except:
                 print(f"[!] API 错误: HTTP {response.status_code}")
+                print(f"[!] 响应内容: {response.text[:500]}")
             return None
         
-        # 处理流式响应
-        buffer = ""
-        full_content = ""
-        
-        # 设置响应编码为 UTF-8
-        response.encoding = 'utf-8'
-        
-        for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
-            if interrupted:
-                break
-            
-            # 确保 chunk 是字符串类型
-            if isinstance(chunk, bytes):
-                try:
-                    chunk = chunk.decode('utf-8', errors='replace')
-                except:
-                    chunk = chunk.decode('latin-1', errors='replace')
-                
-            buffer += chunk
-            
-            while True:
-                # 查找完整的 SSE 行
-                line_end = buffer.find('\n')
-                if line_end == -1:
-                    break
-                
-                line = buffer[:line_end].strip()
-                buffer = buffer[line_end + 1:]
-                
-                if line.startswith('data: '):
-                    data = line[6:]
-                    if data == '[DONE]':
-                        break
-                    
-                    try:
-                        data_obj = json.loads(data)
-                        
-                        # 检查是否有错误
-                        if 'error' in data_obj:
-                            error_msg = data_obj['error'].get('message', 'Unknown error')
-                            # 确保错误消息是 UTF-8 编码
-                            if isinstance(error_msg, bytes):
-                                error_msg = error_msg.decode('utf-8', errors='replace')
-                            print(f"[!] 流式响应错误: {error_msg}")
-                            return None
-                        
-                        # 提取内容
-                        delta = data_obj.get('choices', [{}])[0].get('delta', {})
-                        content = delta.get('content', '')
-                        if content:
-                            # 确保内容是字符串类型
-                            if isinstance(content, bytes):
-                                content = content.decode('utf-8', errors='replace')
-                            full_content += content
-                            print(content, end='', flush=True)
-                            
-                        # 检查 finish_reason
-                        finish_reason = data_obj.get('choices', [{}])[0].get('finish_reason')
-                        if finish_reason == 'error':
-                            print("\n[!] 流式响应因错误终止")
-                            return None
-                            
-                    except json.JSONDecodeError as e:
-                        # JSON 解析错误，跳过这行
-                        pass
-                    except UnicodeDecodeError:
-                        # 编码错误，跳过这行
-                        pass
-        
-        print()  # 换行
-        
-        # 尝试从完整内容中提取 JSON
+        # 处理非流式响应
         try:
-            # 查找 JSON 对象
-            json_start = full_content.find('{')
-            json_end = full_content.rfind('}') + 1
-            if json_start != -1 and json_end > json_start:
-                json_str = full_content[json_start:json_end]
-                result = json.loads(json_str)
-                return result
-            else:
-                # 如果没有找到 JSON，返回原始内容
+            response_data = response.json()
+            
+            # 检查是否有错误
+            if 'error' in response_data:
+                error_msg = response_data['error']
+                if isinstance(error_msg, dict):
+                    error_msg = error_msg.get('message', str(error_msg))
+                print(f"[!] API 返回错误: {error_msg}")
+                return None
+            
+            # 提取完整响应内容
+            choices = response_data.get('choices', [])
+            if not choices:
+                print("[!] API 响应中没有 choices 字段")
+                return None
+            
+            # 获取第一条消息的完整内容
+            message = choices[0].get('message', {})
+            full_content = message.get('content', '')
+            
+            if not full_content:
+                print("[!] API 响应中没有内容")
+                return None
+            
+            # 打印响应内容（用于调试）
+            print(full_content)
+            
+            # 尝试从完整内容中提取 JSON
+            try:
+                # 查找 JSON 对象
+                json_start = full_content.find('{')
+                json_end = full_content.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    json_str = full_content[json_start:json_end]
+                    result = json.loads(json_str)
+                    return result
+                else:
+                    # 如果没有找到 JSON，返回原始内容
+                    return {
+                        "webrtc_usage": "未发现使用",
+                        "evidence": [],
+                        "reasoning": "无法从响应中提取 JSON，原始响应：" + full_content[:200]
+                    }
+            except json.JSONDecodeError as e:
                 return {
                     "webrtc_usage": "未发现使用",
                     "evidence": [],
-                    "reasoning": "无法解析 AI 响应",
-                    "raw_response": full_content
+                    "reasoning": f"AI 响应格式错误: {str(e)}",
+                    "raw_response": full_content[:500]
                 }
-        except json.JSONDecodeError:
-            return {
-                "webrtc_usage": "未发现使用",
-                "evidence": [],
-                "reasoning": "AI 响应格式错误",
-                "raw_response": full_content
-            }
+                
+        except json.JSONDecodeError as e:
+            print(f"[!] 无法解析 JSON 响应: {e}")
+            print(f"[!] 响应内容: {response.text[:500]}")
+            return None
             
     except requests.exceptions.RequestException as e:
         print(f"[!] API 请求失败: {e}")
         return None
 
 
-def analyze_webrtc_initiation(domain: str, page_content: Dict, api_key: str, model: str) -> Optional[Dict]:
+def get_results_file_path(batch_number: int) -> str:
     """
-    使用 AI 模型分析页面内容，判断是否可以从网站直接发起 WebRTC 通信
+    根据批次号生成结果文件路径
     
     Args:
-        domain: 域名
-        page_content: 页面内容字典
-        api_key: OpenRouter API Key
-        model: 模型名称
+        batch_number: 批次号（从1开始）
         
     Returns:
-        AI 分析结果，包含是否可以发起 WebRTC 通信的判断
+        结果文件路径
     """
-    if not api_key:
-        return None
-    
-    # 清理页面内容，确保编码正确
-    content = page_content.get('content', '')
-    title = page_content.get('title', '')
-    
-    # 确保所有字符串都是有效的 UTF-8
-    if not isinstance(content, str):
-        try:
-            content = str(content, encoding='utf-8', errors='replace')
-        except:
-            content = str(content)
-    
-    if not isinstance(title, str):
-        try:
-            title = str(title, encoding='utf-8', errors='replace')
-        except:
-            title = str(title)
-    
-    # 限制内容长度，避免超出 API 限制
-    if len(content) > DEFAULT_MAX_CONTENT_LENGTH:
-        content = content[:DEFAULT_MAX_CONTENT_LENGTH]
-    
-    # 构建提示词
-    prompt = f"""
-你是一名精通前端与实时通信技术的分析专家。现在需要你判断该网站是否支持从网页直接发起 WebRTC 通信（无需下载软件或联系工作人员）。
-
-请仔细分析以下 HTML 源码，查找以下关键证据：
-
-1. 明确的发起通信按钮或组件
-查找以下按钮文字、链接或组件：
-- "立即开始"、"开始会议"、"加入会议"、"立即加入"、"开始通话"、"发起会议"、"创建会议"
-- "Try Now"、"Start Meeting"、"Join Meeting"、"Start Demo"、"Try Demo"、"立即体验"、"免费试用"
-- "视频通话"、"语音通话"、"屏幕共享"、"开始共享"、"开始演示"
-- 查找 button、a、input[type="button"] 等元素，以及相关的 onclick、href 属性
-
-2. 在线演示或 Demo 功能
-查找以下线索：
-- "Demo"、"演示"、"试用"、"体验"、"在线试用"、"在线演示"
-- iframe 嵌入的通信组件
-- 可以直接点击启动的演示功能
-
-3. 需要额外步骤的情况
-如果发现以下情况，应判定为"可能较小"：
-- "下载应用"、"下载软件"、"Download"、"Install"、"获取应用"
-- "联系销售"、"联系客服"、"Contact Sales"、"Schedule a Demo"
-- "申请试用"、"申请演示"、"Request Demo" 等需要人工介入的步骤
-- 页面仅提供产品介绍，没有直接发起通信的功能
-
-4. 输出格式
-
-请以 JSON 格式返回结果：
-{{
-    "can_initiate": "可行"/"可能较大"/"可能较小",
-    "confidence": "high/medium/low",
-    "reasons": ["原因1", "原因2", ...],
-    "buttons_or_components_found": ["发现的按钮或组件1", "发现的按钮或组件2", ...],
-    "requires_additional_steps": true/false,
-    "additional_steps": ["需要下载软件", "需要联系销售"]  // 如果有额外步骤，列出具体步骤
-}}
-
-以下是网站 HTML 源码
-
-域名: {domain}
-URL: {page_content['url']}
-标题: {title}
-
-页面内容:
-{content}
-"""
-    
-    # 确保 prompt 是有效的 UTF-8 字符串
-    if not isinstance(prompt, str):
-        prompt = str(prompt, encoding='utf-8', errors='replace')
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/turn-client",  # OpenRouter API 要求的头部
-        "X-Title": "WebRTC Domain Scanner"  # OpenRouter API 要求的头部
-    }
-    
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "stream": True,
-        "temperature": AI_TEMPERATURE
-    }
-    
-    try:
-        response = requests.post(
-            OPENROUTER_API_URL,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=AI_STREAM_TIMEOUT
-        )
-        
-        # 检查初始状态码
-        if response.status_code != 200:
-            try:
-                error_data = response.json()
-                print(f"[!] API 错误: {error_data.get('error', {}).get('message', 'Unknown error')}")
-            except:
-                print(f"[!] API 错误: HTTP {response.status_code}")
-            return None
-        
-        # 处理流式响应
-        buffer = ""
-        full_content = ""
-        
-        # 设置响应编码为 UTF-8
-        response.encoding = 'utf-8'
-        
-        for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
-            if interrupted:
-                break
-            
-            # 确保 chunk 是字符串类型
-            if isinstance(chunk, bytes):
-                try:
-                    chunk = chunk.decode('utf-8', errors='replace')
-                except:
-                    chunk = chunk.decode('latin-1', errors='replace')
-                
-            buffer += chunk
-            
-            while True:
-                # 查找完整的 SSE 行
-                line_end = buffer.find('\n')
-                if line_end == -1:
-                    break
-                
-                line = buffer[:line_end].strip()
-                buffer = buffer[line_end + 1:]
-                
-                if line.startswith('data: '):
-                    data = line[6:]
-                    if data == '[DONE]':
-                        break
-                    
-                    try:
-                        data_obj = json.loads(data)
-                        
-                        # 检查是否有错误
-                        if 'error' in data_obj:
-                            error_msg = data_obj['error'].get('message', 'Unknown error')
-                            # 确保错误消息是 UTF-8 编码
-                            if isinstance(error_msg, bytes):
-                                error_msg = error_msg.decode('utf-8', errors='replace')
-                            print(f"[!] 流式响应错误: {error_msg}")
-                            return None
-                        
-                        # 提取内容
-                        delta = data_obj.get('choices', [{}])[0].get('delta', {})
-                        content = delta.get('content', '')
-                        if content:
-                            # 确保内容是字符串类型
-                            if isinstance(content, bytes):
-                                content = content.decode('utf-8', errors='replace')
-                            full_content += content
-                            print(content, end='', flush=True)
-                            
-                        # 检查 finish_reason
-                        finish_reason = data_obj.get('choices', [{}])[0].get('finish_reason')
-                        if finish_reason == 'error':
-                            print("\n[!] 流式响应因错误终止")
-                            return None
-                            
-                    except json.JSONDecodeError as e:
-                        # JSON 解析错误，跳过这行
-                        pass
-                    except UnicodeDecodeError:
-                        # 编码错误，跳过这行
-                        pass
-        
-        print()  # 换行
-        
-        # 尝试从完整内容中提取 JSON
-        try:
-            # 查找 JSON 对象
-            json_start = full_content.find('{')
-            json_end = full_content.rfind('}') + 1
-            if json_start != -1 and json_end > json_start:
-                json_str = full_content[json_start:json_end]
-                result = json.loads(json_str)
-                return result
-            else:
-                # 如果没有找到 JSON，返回原始内容
-                return {
-                    "can_initiate": "unknown",
-                    "confidence": "unknown",
-                    "reasons": ["无法解析 AI 响应"],
-                    "raw_response": full_content
-                }
-        except json.JSONDecodeError:
-            return {
-                "can_initiate": "unknown",
-                "confidence": "unknown",
-                "reasons": ["AI 响应格式错误"],
-                "raw_response": full_content
-            }
-            
-    except requests.exceptions.RequestException as e:
-        print(f"[!] API 请求失败: {e}")
-        return None
+    return f"{RESULTS_FILE_PREFIX}_{batch_number:04d}{RESULTS_FILE_SUFFIX}"
 
 
 def save_progress(current_line: int, results: List[Dict]):
-    """保存进度和结果（线程安全）"""
+    """
+    保存进度和结果（线程安全）
+    每1000个域名保存到一个文件
+    
+    Args:
+        current_line: 当前处理的行号（用于兼容，实际会从 results 中计算最大行号）
+        results: 所有结果列表
+    """
     with file_lock:
+        # 计算当前批次号（从1开始）
+        total_processed = len(results)
+        current_batch = (total_processed - 1) // BATCH_SIZE + 1
+        
+        # 从结果中计算实际的最大行号
+        if results:
+            actual_last_line = max((r.get("line", 0) for r in results), default=current_line)
+        else:
+            actual_last_line = current_line
+        
+        # 保存进度信息
         progress = {
-            "last_line": current_line,
+            "last_line": actual_last_line,  # 使用实际的最大行号
             "timestamp": datetime.now().isoformat(),
-            "total_processed": len(results)
+            "total_processed": total_processed,
+            "current_batch": current_batch,
+            "current_batch_size": total_processed % BATCH_SIZE if total_processed % BATCH_SIZE != 0 else BATCH_SIZE
         }
         
         with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
             json.dump(progress, f, indent=2, ensure_ascii=False)
         
-        with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        # 计算当前批次的结果
+        batch_start = (current_batch - 1) * BATCH_SIZE
+        batch_end = min(batch_start + BATCH_SIZE, total_processed)
+        current_batch_results = results[batch_start:batch_end]
+        
+        # 保存当前批次的结果
+        current_batch_file = get_results_file_path(current_batch)
+        with open(current_batch_file, 'w', encoding='utf-8') as f:
+            json.dump(current_batch_results, f, indent=2, ensure_ascii=False)
+        
+        # 如果当前批次已满，打印提示
+        if len(current_batch_results) == BATCH_SIZE:
+            print(f"[+] 批次 {current_batch} 已满（{BATCH_SIZE} 个域名），已保存到 {current_batch_file}")
 
 
 def load_progress() -> int:
@@ -716,13 +503,92 @@ def load_progress() -> int:
     return 1
 
 
-def load_results() -> List[Dict]:
-    """加载已有结果（线程安全）"""
+def load_results(verbose: bool = False) -> List[Dict]:
+    """
+    加载已有结果（线程安全）
+    从所有批次文件中加载结果
+    
+    Args:
+        verbose: 是否显示详细的加载信息
+    """
     with file_lock:
         results = []
-        if os.path.exists(RESULTS_FILE):
-            with open(RESULTS_FILE, 'r', encoding='utf-8') as f:
-                results = json.load(f)
+        
+        # 首先检查进度文件，获取当前批次信息
+        current_batch = 1
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+                    current_batch = progress.get("current_batch", 1)
+            except:
+                pass
+        
+        # 兼容旧格式：如果存在旧的单文件格式，先加载它
+        old_results_file = f"{RESULTS_FILE_PREFIX}{RESULTS_FILE_SUFFIX}"
+        old_file_loaded = False
+        
+        # 检查是否已经存在批次文件
+        first_batch_file = get_results_file_path(1)
+        has_batch_files = os.path.exists(first_batch_file)
+        
+        if os.path.exists(old_results_file) and not has_batch_files:
+            # 只有在没有批次文件时才转换旧文件
+            try:
+                with open(old_results_file, 'r', encoding='utf-8') as f:
+                    old_results = json.load(f)
+                    if old_results:
+                        results.extend(old_results)
+                        old_file_loaded = True
+                        if verbose:
+                            print(f"[*] 加载旧格式文件: {old_results_file} ({len(old_results)} 个结果)")
+                        # 将旧文件转换为批次文件格式
+                        if len(old_results) > 0:
+                            batch_num = 1
+                            for i in range(0, len(old_results), BATCH_SIZE):
+                                batch_results = old_results[i:i+BATCH_SIZE]
+                                batch_file = get_results_file_path(batch_num)
+                                with open(batch_file, 'w', encoding='utf-8') as bf:
+                                    json.dump(batch_results, bf, indent=2, ensure_ascii=False)
+                                if verbose:
+                                    print(f"[*] 转换旧文件到批次 {batch_num}: {batch_file} ({len(batch_results)} 个结果)")
+                                batch_num += 1
+                        # 备份旧文件
+                        backup_file = f"{old_results_file}.backup"
+                        if not os.path.exists(backup_file):
+                            import shutil
+                            shutil.copy2(old_results_file, backup_file)
+                            if verbose:
+                                print(f"[*] 旧文件已备份到: {backup_file}")
+            except Exception as e:
+                if verbose:
+                    print(f"[!] 加载旧格式文件失败: {e}")
+        
+        # 加载所有已存在的批次文件
+        # 如果已经从旧文件加载了，计算应该从哪个批次开始加载
+        start_batch = 1
+        if old_file_loaded and results:
+            # 计算已加载的结果对应的批次数量
+            loaded_batches = (len(results) - 1) // BATCH_SIZE + 1
+            start_batch = loaded_batches + 1
+        
+        batch_num = start_batch
+        while True:
+            batch_file = get_results_file_path(batch_num)
+            if os.path.exists(batch_file):
+                try:
+                    with open(batch_file, 'r', encoding='utf-8') as f:
+                        batch_results = json.load(f)
+                        results.extend(batch_results)
+                        if verbose:
+                            print(f"[*] 加载批次 {batch_num}: {len(batch_results)} 个结果")
+                except Exception as e:
+                    if verbose:
+                        print(f"[!] 加载批次文件 {batch_file} 失败: {e}")
+                batch_num += 1
+            else:
+                break
+        
         return results
 
 
@@ -731,8 +597,8 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
     处理单个域名（线程安全）
     
     Args:
-        domain_info: 域名信息字典，包含 rank 和 domain
-        start_line: 起始行号
+        domain_info: 域名信息字典，包含 rank、domain 和 line
+        start_line: 起始行号（已废弃，保留用于兼容）
         api_key: OpenRouter API Key
         model: 模型名称
         delay: 延迟时间
@@ -744,9 +610,16 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
     """
     rank = domain_info["rank"]
     domain = domain_info["domain"]
+    actual_line = domain_info.get("line", start_line)  # 使用实际行号
+    
+    # 将 rank 转换为整数用于线程分配
+    try:
+        rank_int = int(rank)
+    except (ValueError, TypeError):
+        rank_int = hash(rank) % 1000000  # 如果 rank 不是数字，使用哈希值
     
     # 根据 rank % num_threads == thread_id - 1 判断是否由当前线程处理
-    if rank % num_threads != thread_id - 1:
+    if rank_int % num_threads != thread_id - 1:
         return None  # 不属于当前线程处理
     
     # 加载已有结果并检查是否已处理
@@ -757,21 +630,21 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
     )
     
     if already_processed:
-        print(f"[线程 {thread_id}] 域名 {domain} (排名: {rank}) 已处理过，跳过")
+        print(f"[线程 {thread_id}] 域名 {domain} (排名: {rank}, 行号: {actual_line}) 已处理过，跳过")
         return None
     
-    print(f"[线程 {thread_id}] 处理域名: {domain} (排名: {rank})")
+    print(f"[线程 {thread_id}] 处理域名: {domain} (排名: {rank}, 行号: {actual_line})")
     
-    # 获取主页内容
-    print(f"[线程 {thread_id}] 获取主页内容...")
-    page_content = fetch_homepage(domain)
+    # 获取主页内容并提取元素
+    print(f"[线程 {thread_id}] 获取主页内容并提取元素...")
+    elements_data = fetch_and_extract_elements(domain)
     
-    if not page_content:
+    if not elements_data:
         print(f"[线程 {thread_id}] 无法获取主页内容")
         result = {
             "rank": rank,
             "domain": domain,
-            "line": start_line + rank - 1,  # 估算行号
+            "line": actual_line,  # 使用实际行号
             "timestamp": datetime.now().isoformat(),
             "status": "failed",
             "error": "无法获取主页内容",
@@ -782,23 +655,33 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
         with results_lock:
             results = load_results()
             results.append(result)
-            save_progress(start_line + rank - 1, results)
+            save_progress(actual_line, results)
         
         time.sleep(delay)
         return result
     
-    print(f"[线程 {thread_id}] 成功获取主页内容 ({page_content['content_length']} 字符)")
-    print(f"[线程 {thread_id}] URL: {page_content['url']}")
-    print(f"[线程 {thread_id}] 标题: {page_content['title']}")
+    print(f"[线程 {thread_id}] 成功获取主页内容并提取元素")
+    print(f"[线程 {thread_id}] URL: {elements_data['url']}")
+    print(f"[线程 {thread_id}] 标题: {elements_data['title']}")
+    elements = elements_data.get('elements', {})
+    print(f"[线程 {thread_id}] 提取的元素: {len(elements.get('buttons', []))} 个按钮, {len(elements.get('links', []))} 个链接, {len(elements.get('inputs', []))} 个输入框")
     
-    # 两阶段 AI 分析：先用快速模型，如果结果是"可能使用"则用更准确的模型重新判断
-    print(f"[线程 {thread_id}] 第一阶段：使用快速模型 (google/gemini-2.0-flash-001) 分析 WebRTC 服务...")
-    ai_result = analyze_webrtc_with_ai(domain, page_content, api_key, "google/gemini-2.0-flash-001")
+    # 两阶段 AI 分析：先用快速模型，如果出错或结果是"可能使用"则用更准确的模型重新判断
+    print(f"[线程 {thread_id}] 第一阶段：使用快速模型 (gemini-2.0-flash-exp) 分析 WebRTC 服务...")
+    ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
     
+    # 如果第一次判断失败（返回 None），使用更准确的模型重新判断
+    if not ai_result:
+        print(f"[线程 {thread_id}] 第一阶段分析失败，使用更准确模型 (gemini-2.5-pro) 重新尝试...")
+        ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
+        if ai_result:
+            print(f"[线程 {thread_id}] 使用昂贵模型分析成功")
+        else:
+            print(f"[线程 {thread_id}] 昂贵模型分析也失败")
     # 如果第一次判断结果是"可能使用"，使用更准确的模型重新判断
-    if ai_result and ai_result.get("webrtc_usage") == "可能使用":
-        print(f"[线程 {thread_id}] 第一阶段结果为'可能使用'，使用更准确模型 (google/gemini-2.5-pro) 重新判断...")
-        second_result = analyze_webrtc_with_ai(domain, page_content, api_key, "google/gemini-2.5-pro")
+    elif ai_result.get("webrtc_usage") == "可能使用":
+        print(f"[线程 {thread_id}] 第一阶段结果为'可能使用'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
+        second_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
         if second_result:
             # 以第二次判断的结果为准
             ai_result = second_result
@@ -827,39 +710,27 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
         print(f"[线程 {thread_id}]   WebRTC 使用情况: {webrtc_usage}")
         print(f"[线程 {thread_id}]   置信度: {confidence}")
         
-        # 如果判断存在 WebRTC 服务，进一步判断是否可以从网站发起通信
-        initiation_analysis = None
-        if has_webrtc:
-            # 使用更准确的模型进行发起通信能力分析
-            print(f"[线程 {thread_id}] 检测到 WebRTC 服务，进一步分析是否可从网站发起通信...")
-            initiation_analysis = analyze_webrtc_initiation(domain, page_content, api_key, "google/gemini-2.5-pro")
-            
-            if initiation_analysis:
-                can_initiate = initiation_analysis.get("can_initiate", "unknown")
-                print(f"[线程 {thread_id}] 发起通信能力: {can_initiate}")
-        
         result = {
             "rank": rank,
             "domain": domain,
-            "line": start_line + rank - 1,  # 估算行号
+            "line": actual_line,  # 使用实际行号
             "timestamp": datetime.now().isoformat(),
             "status": "success",
             "thread_id": thread_id,
             "page_info": {
-                "url": page_content["url"],
-                "status_code": page_content["status_code"],
-                "content_type": page_content["content_type"],
-                "title": page_content["title"],
-                "content_length": page_content["content_length"],
-                "content_preview": page_content.get("content_preview", "")
+                "url": elements_data["url"],
+                "status_code": elements_data["status_code"],
+                "content_type": elements_data["content_type"],
+                "title": elements_data["title"],
+                "content_length": elements_data["content_length"],
+                "content_preview": elements_data.get("content_preview", "")
             },
             "ai_analysis": {
                 "webrtc_usage": webrtc_usage,
                 "has_webrtc": has_webrtc,
                 "confidence": confidence,
                 "evidence": evidence,
-                "reasoning": reasoning,
-                "initiation_analysis": initiation_analysis
+                "reasoning": reasoning
             }
         }
     else:
@@ -867,17 +738,17 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
         result = {
             "rank": rank,
             "domain": domain,
-            "line": start_line + rank - 1,  # 估算行号
+            "line": actual_line,  # 使用实际行号
             "timestamp": datetime.now().isoformat(),
             "status": "ai_failed",
             "thread_id": thread_id,
             "page_info": {
-                "url": page_content["url"],
-                "status_code": page_content["status_code"],
-                "content_type": page_content["content_type"],
-                "title": page_content["title"],
-                "content_length": page_content["content_length"],
-                "content_preview": page_content.get("content_preview", "")
+                "url": elements_data["url"],
+                "status_code": elements_data["status_code"],
+                "content_type": elements_data["content_type"],
+                "title": elements_data["title"],
+                "content_length": elements_data["content_length"],
+                "content_preview": elements_data.get("content_preview", "")
             },
             "error": "AI 分析失败"
         }
@@ -886,7 +757,7 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
     with results_lock:
         results = load_results()
         results.append(result)
-        save_progress(start_line + rank - 1, results)
+        save_progress(actual_line, results)  # 使用实际行号
     
     # 延迟
     time.sleep(delay)
@@ -958,6 +829,10 @@ def main():
         start_line = load_progress()
         if start_line > 1:
             print(f"[+] 从上次停止的位置继续: 第 {start_line} 行")
+            # 加载已有结果并显示批次信息
+            existing_results = load_results(verbose=True)
+            if existing_results:
+                print(f"[+] 已加载 {len(existing_results)} 个已有结果")
     
     # 读取域名列表
     print(f"[+] 读取域名列表: {args.csv}")
@@ -1036,7 +911,7 @@ def main():
         print(f"[+] 使用单线程模式")
         
         # 加载已有结果
-        results = load_results()
+        results = load_results(verbose=(args.resume or start_line is not None))
         
         # 处理每个域名
         for i, domain_info in enumerate(domains, start=1):
@@ -1054,7 +929,7 @@ def main():
             
             rank = domain_info["rank"]
             domain = domain_info["domain"]
-            current_line = (start_line or 1) + i - 1
+            current_line = domain_info.get("line", (start_line or 1) + i - 1)  # 使用实际行号
             
             print(f"\n[{i}/{len(domains)}] 处理域名: {domain} (排名: {rank}, 行号: {current_line})")
             
@@ -1068,11 +943,11 @@ def main():
                 print(f"[*] 已处理过，跳过")
                 continue
             
-            # 获取主页内容
-            print(f"[*] 获取主页内容...")
-            page_content = fetch_homepage(domain)
+            # 获取主页内容并提取元素
+            print(f"[*] 获取主页内容并提取元素...")
+            elements_data = fetch_and_extract_elements(domain)
             
-            if not page_content:
+            if not elements_data:
                 print(f"[!] 无法获取主页内容")
                 result = {
                     "rank": rank,
@@ -1087,19 +962,28 @@ def main():
                 time.sleep(args.delay)
                 continue
             
-            print(f"[+] 成功获取主页内容 ({page_content['content_length']} 字符)")
-            print(f"    URL: {page_content['url']}")
-            print(f"    标题: {page_content['title']}")
-            print(f"    内容预览: {repr(page_content.get('content_preview', ''))}")
+            print(f"[+] 成功获取主页内容并提取元素")
+            print(f"    URL: {elements_data['url']}")
+            print(f"    标题: {elements_data['title']}")
+            elements = elements_data.get('elements', {})
+            print(f"    提取的元素: {len(elements.get('buttons', []))} 个按钮, {len(elements.get('links', []))} 个链接, {len(elements.get('inputs', []))} 个输入框")
             
-            # 两阶段 AI 分析：先用快速模型，如果结果是"可能使用"则用更准确的模型重新判断
-            print(f"[*] 第一阶段：使用快速模型 (google/gemini-2.0-flash-001) 分析 WebRTC 服务...")
-            ai_result = analyze_webrtc_with_ai(domain, page_content, api_key, "google/gemini-2.0-flash-001")
+            # 两阶段 AI 分析：先用快速模型，如果出错或结果是"可能使用"则用更准确的模型重新判断
+            print(f"[*] 第一阶段：使用快速模型 (gemini-2.0-flash-exp) 分析 WebRTC 服务...")
+            ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
             
+            # 如果第一次判断失败（返回 None），使用更准确的模型重新判断
+            if not ai_result:
+                print(f"[*] 第一阶段分析失败，使用更准确模型 (gemini-2.5-pro) 重新尝试...")
+                ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
+                if ai_result:
+                    print(f"[+] 使用昂贵模型分析成功")
+                else:
+                    print(f"[!] 昂贵模型分析也失败")
             # 如果第一次判断结果是"可能使用"，使用更准确的模型重新判断
-            if ai_result and ai_result.get("webrtc_usage") == "可能使用":
-                print(f"[*] 第一阶段结果为'可能使用'，使用更准确模型 (google/gemini-2.5-pro) 重新判断...")
-                second_result = analyze_webrtc_with_ai(domain, page_content, api_key, "google/gemini-2.5-pro")
+            elif ai_result.get("webrtc_usage") == "可能使用":
+                print(f"[*] 第一阶段结果为'可能使用'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
+                second_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
                 if second_result:
                     # 以第二次判断的结果为准
                     ai_result = second_result
@@ -1132,17 +1016,6 @@ def main():
                 if reasoning:
                     print(f"    推理: {reasoning[:200]}...")
                 
-                # 如果判断存在 WebRTC 服务，进一步判断是否可以从网站发起通信
-                initiation_analysis = None
-                if has_webrtc:
-                    # 使用更准确的模型进行发起通信能力分析
-                    print(f"[*] 检测到 WebRTC 服务，进一步分析是否可从网站发起通信...")
-                    initiation_analysis = analyze_webrtc_initiation(domain, page_content, api_key, "google/gemini-2.5-pro")
-                    
-                    if initiation_analysis:
-                        can_initiate = initiation_analysis.get("can_initiate", "unknown")
-                        print(f"[+] 发起通信能力: {can_initiate}")
-                
                 result = {
                     "rank": rank,
                     "domain": domain,
@@ -1150,20 +1023,19 @@ def main():
                     "timestamp": datetime.now().isoformat(),
                     "status": "success",
                     "page_info": {
-                        "url": page_content["url"],
-                        "status_code": page_content["status_code"],
-                        "content_type": page_content["content_type"],
-                        "title": page_content["title"],
-                        "content_length": page_content["content_length"],
-                        "content_preview": page_content.get("content_preview", "")
+                        "url": elements_data["url"],
+                        "status_code": elements_data["status_code"],
+                        "content_type": elements_data["content_type"],
+                        "title": elements_data["title"],
+                        "content_length": elements_data["content_length"],
+                        "content_preview": elements_data.get("content_preview", "")
                     },
                     "ai_analysis": {
                         "webrtc_usage": webrtc_usage,
                         "has_webrtc": has_webrtc,
                         "confidence": confidence,
                         "evidence": evidence,
-                        "reasoning": reasoning,
-                        "initiation_analysis": initiation_analysis
+                        "reasoning": reasoning
                     }
                 }
             else:
@@ -1175,12 +1047,12 @@ def main():
                     "timestamp": datetime.now().isoformat(),
                     "status": "ai_failed",
                     "page_info": {
-                        "url": page_content["url"],
-                        "status_code": page_content["status_code"],
-                        "content_type": page_content["content_type"],
-                        "title": page_content["title"],
-                        "content_length": page_content["content_length"],
-                        "content_preview": page_content.get("content_preview", "")
+                        "url": elements_data["url"],
+                        "status_code": elements_data["status_code"],
+                        "content_type": elements_data["content_type"],
+                        "title": elements_data["title"],
+                        "content_length": elements_data["content_length"],
+                        "content_preview": elements_data.get("content_preview", "")
                     },
                     "error": "AI 分析失败"
                 }
@@ -1225,7 +1097,29 @@ def main():
     print(f"包含 WebRTC: {has_webrtc}")
     print(f"  确定使用: {definitely_uses}")
     print(f"  可能使用: {possibly_uses}")
-    print(f"\n结果已保存到: {RESULTS_FILE}")
+    
+    # 显示所有批次文件信息
+    print(f"\n结果文件:")
+    batch_num = 1
+    total_batches = 0
+    while True:
+        batch_file = get_results_file_path(batch_num)
+        if os.path.exists(batch_file):
+            try:
+                with open(batch_file, 'r', encoding='utf-8') as f:
+                    batch_results = json.load(f)
+                    print(f"  批次 {batch_num}: {batch_file} ({len(batch_results)} 个结果)")
+                    total_batches += 1
+            except:
+                pass
+            batch_num += 1
+        else:
+            break
+    
+    if total_batches == 0:
+        print(f"  无结果文件")
+    else:
+        print(f"\n共 {total_batches} 个批次文件")
 
 
 if __name__ == "__main__":

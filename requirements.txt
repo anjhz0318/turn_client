@@ -9,6 +9,12 @@ dnspython>=2.4.0
 # 字符编码检测库（可选，但推荐用于更好的编码处理）
 chardet>=5.2.0
 
+# HTML 解析库（用于页面元素提取）
+beautifulsoup4>=4.12.0
+
+# 环境变量管理库（用于读取 .env 文件）
+python-dotenv>=1.0.0
+
 # urllib3 通常随 requests 一起安装，但明确列出以确保版本兼容性
 urllib3>=2.0.0
 

@@ -15,12 +15,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 导入主脚本的核心函数
 from webrtc_domain_scanner import (
-    fetch_homepage,
     analyze_webrtc_with_ai,
-    analyze_webrtc_initiation,
     get_api_key,
     DEFAULT_MODEL,
     validate_config
+)
+
+# 导入页面元素提取器
+from page_element_extractor import (
+    fetch_and_extract_elements,
+    format_elements_for_ai
 )
 
 
@@ -37,42 +41,55 @@ def test_single_domain(domain: str, api_key: str, model: str):
     print(f"测试域名: {domain}")
     print("="*60)
     
-    # 获取主页内容
-    print(f"\n[1/3] 获取主页内容...")
-    page_content = fetch_homepage(domain)
+    # 获取主页内容并提取元素
+    print(f"\n[1/3] 获取主页内容并提取元素...")
+    elements_data = fetch_and_extract_elements(domain)
     
-    if not page_content:
+    if not elements_data:
         print(f"[!] 无法获取主页内容")
         return None
     
-    print(f"[+] 成功获取主页内容")
-    print(f"    URL: {page_content['url']}")
-    print(f"    状态码: {page_content['status_code']}")
-    print(f"    Content-Type: {page_content['content_type']}")
-    print(f"    标题: {page_content['title']}")
-    print(f"    内容长度: {page_content['content_length']} 字符")
-    print(f"    内容预览: {repr(page_content.get('content_preview', ''))}")
+    print(f"[+] 成功获取主页内容并提取元素")
+    print(f"    URL: {elements_data['url']}")
+    print(f"    状态码: {elements_data['status_code']}")
+    print(f"    Content-Type: {elements_data['content_type']}")
+    print(f"    标题: {elements_data['title']}")
+    print(f"    内容长度: {elements_data['content_length']} 字符")
+    elements = elements_data.get('elements', {})
+    print(f"    提取的元素: {len(elements.get('buttons', []))} 个按钮, {len(elements.get('links', []))} 个链接, {len(elements.get('inputs', []))} 个输入框")
     
-    # 两阶段 AI 分析：先用快速模型，如果结果是"可能使用"则用更准确的模型重新判断
-    print(f"\n[2/4] 第一阶段：使用快速模型 (google/gemini-2.0-flash-001) 分析 WebRTC 服务...")
-    ai_result = analyze_webrtc_with_ai(domain, page_content, api_key, "google/gemini-2.0-flash-001")
+    # 计算并输出元素信息文本长度
+    from page_element_extractor import format_elements_for_ai
+    elements_text = format_elements_for_ai(elements_data)
+    elements_text_length = len(elements_text)
+    print(f"    元素信息文本长度: {elements_text_length} 字符（用于估算 token 消耗）")
     
+    # 两阶段 AI 分析：先用快速模型，如果出错或结果是"可能使用"则用更准确的模型重新判断
+    print(f"\n[2/3] 第一阶段：使用快速模型 (gemini-2.0-flash-exp) 分析 WebRTC 服务...")
+    ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
+    
+    # 如果第一次判断失败（返回 None），使用更准确的模型重新判断
     if not ai_result:
-        print(f"[!] 第一阶段 AI 分析失败")
-        return {
-            "domain": domain,
-            "timestamp": datetime.now().isoformat(),
-            "status": "ai_failed",
-            "page_info": {
-                "url": page_content["url"],
-                "status_code": page_content["status_code"],
-                "content_type": page_content["content_type"],
-                "title": page_content["title"],
-                "content_length": page_content["content_length"],
-                "content_preview": page_content.get("content_preview", "")
-            },
-            "error": "第一阶段 AI 分析失败"
-        }
+        print(f"[!] 第一阶段分析失败，使用更准确模型 (gemini-2.5-pro) 重新尝试...")
+        ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
+        if ai_result:
+            print(f"[+] 使用昂贵模型分析成功")
+        else:
+            print(f"[!] 昂贵模型分析也失败")
+            return {
+                "domain": domain,
+                "timestamp": datetime.now().isoformat(),
+                "status": "ai_failed",
+                "page_info": {
+                    "url": elements_data["url"],
+                    "status_code": elements_data["status_code"],
+                    "content_type": elements_data["content_type"],
+                    "title": elements_data["title"],
+                    "content_length": elements_data["content_length"],
+                    "content_preview": elements_data.get("content_preview", "")
+                },
+                "error": "AI 分析失败（廉价模型和昂贵模型都失败）"
+            }
     
     # 解析第一阶段的 JSON 格式
     webrtc_usage = ai_result.get("webrtc_usage", "未发现使用")
@@ -90,8 +107,8 @@ def test_single_domain(domain: str, api_key: str, model: str):
     
     # 如果第一次判断结果是"可能使用"，使用更准确的模型重新判断
     if webrtc_usage == "可能使用":
-        print(f"\n[3/4] 第一阶段结果为'可能使用'，使用更准确模型 (google/gemini-2.5-pro) 重新判断...")
-        second_result = analyze_webrtc_with_ai(domain, page_content, api_key, "google/gemini-2.5-pro")
+        print(f"\n[3/3] 第一阶段结果为'可能使用'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
+        second_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
         if second_result:
             # 以第二次判断的结果为准
             ai_result = second_result
@@ -120,63 +137,25 @@ def test_single_domain(domain: str, api_key: str, model: str):
     else:
         confidence = "low"
     
-    # 如果判断存在 WebRTC，进行发起通信能力分析
-    initiation_analysis = None
-    if has_webrtc:
-        print(f"\n[4/4] 检测到 WebRTC 服务，分析是否可从网站发起通信...")
-        # 使用更准确的模型进行发起通信能力分析
-        initiation_analysis = analyze_webrtc_initiation(domain, page_content, api_key, "google/gemini-2.5-pro")
-        
-        if initiation_analysis:
-            can_initiate = initiation_analysis.get("can_initiate", "unknown")
-            init_confidence = initiation_analysis.get("confidence", "unknown")
-            init_reasons = initiation_analysis.get("reasons", [])
-            buttons_found = initiation_analysis.get("buttons_or_components_found", [])
-            requires_steps = initiation_analysis.get("requires_additional_steps", False)
-            additional_steps = initiation_analysis.get("additional_steps", [])
-            
-            print(f"[+] 发起通信能力分析结果:")
-            print(f"    可以发起: {can_initiate}")
-            print(f"    置信度: {init_confidence}")
-            if init_reasons:
-                print(f"    原因:")
-                for reason in init_reasons:
-                    print(f"      - {reason}")
-            if buttons_found:
-                print(f"    发现的按钮/组件:")
-                for button in buttons_found:
-                    print(f"      - {button}")
-            if requires_steps:
-                print(f"    需要额外步骤: 是")
-                if additional_steps:
-                    print(f"    额外步骤:")
-                    for step in additional_steps:
-                        print(f"      - {step}")
-        else:
-            print(f"[!] 发起通信能力分析失败")
-    else:
-        print(f"\n[4/4] 未检测到 WebRTC 服务，跳过发起通信能力分析")
-    
     # 构建结果
     result = {
         "domain": domain,
         "timestamp": datetime.now().isoformat(),
         "status": "success",
         "page_info": {
-            "url": page_content["url"],
-            "status_code": page_content["status_code"],
-            "content_type": page_content["content_type"],
-            "title": page_content["title"],
-            "content_length": page_content["content_length"],
-            "content_preview": page_content.get("content_preview", "")
+            "url": elements_data["url"],
+            "status_code": elements_data["status_code"],
+            "content_type": elements_data["content_type"],
+            "title": elements_data["title"],
+            "content_length": elements_data["content_length"],
+            "content_preview": elements_data.get("content_preview", "")
         },
         "ai_analysis": {
             "webrtc_usage": webrtc_usage,  # 新格式：确定使用 | 可能使用 | 未发现使用
             "has_webrtc": has_webrtc,  # 向后兼容：布尔值
             "confidence": confidence,  # 根据 webrtc_usage 推断的置信度
             "evidence": evidence,  # 新格式：证据列表
-            "reasoning": reasoning,  # 新格式：推理过程
-            "initiation_analysis": initiation_analysis  # 发起通信能力分析
+            "reasoning": reasoning  # 新格式：推理过程
         }
     }
     

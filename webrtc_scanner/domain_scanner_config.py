@@ -1,29 +1,48 @@
 #!/usr/bin/env python3
 """
 WebRTC 域名扫描器配置文件
-配置 OpenRouter API 和其他扫描参数
+配置智增增 (zhizengzeng) API 和其他扫描参数
 """
 
 import os
+from pathlib import Path
 
-# OpenRouter API 配置
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-# 如果环境变量未设置，可以在这里直接设置（不推荐，建议使用环境变量）
-OPENROUTER_API_KEY = "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"
+# 尝试加载 .env 文件
+try:
+    from dotenv import load_dotenv
+    # 获取配置文件所在目录
+    config_dir = Path(__file__).parent
+    env_file = config_dir / '.env'
+    # 如果 .env 文件存在，则加载它
+    if env_file.exists():
+        load_dotenv(env_file)
+except ImportError:
+    # 如果 python-dotenv 未安装，跳过 .env 文件加载
+    pass
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# 智增增 API 配置
+# 优先级：环境变量 > .env 文件 > 空字符串
+# 支持 OPENROUTER_API_KEY 和 API_SECRET_KEY 两种环境变量名（向后兼容）
+API_KEY = os.getenv("API_SECRET_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = API_KEY  # 保持向后兼容
+
+# 智增增 API Base URL（兼容 OpenAI API 格式）
+API_BASE_URL = "https://api.zhizengzeng.com/v1"
+OPENROUTER_API_URL = f"{API_BASE_URL}/chat/completions"  # 保持向后兼容
 
 # 默认模型配置
-DEFAULT_MODEL = "google/gemini-2.0-flash-001"  # 使用更经济的模型
+# 注意：智增增的模型名称不需要前缀（如 google/、openai/ 等）
+DEFAULT_MODEL = "gemini-2.0-flash-exp"  # 使用更经济的模型
 
 # 可用的模型列表（可选）
+# 智增增支持的模型名称格式：直接使用模型名，不需要前缀
 AVAILABLE_MODELS = {
-    "gpt4o-mini": "openai/gpt-4o-mini",  # 经济实惠，速度快
-    "gpt4o": "openai/gpt-4o",  # 性能更好，准确性高
-    "claude-haiku": "anthropic/claude-3-haiku",  # 速度快，成本低
-    "gemini-flash": "google/gemini-2.0-flash-001", # 速度快，成本低
-    "gemini-pro": "google/gemini-2.5-pro",  # Google 模型
-    "deepseek-r1": "deepseek/deepseek-r1-0528",  # 深度求索模型
+    "gpt4o-mini": "gpt-4o-mini",  # OpenAI 模型
+    "gpt4o": "gpt-4o",  # OpenAI 模型
+    "claude-haiku": "claude-3-haiku",  # Anthropic 模型
+    "gemini-flash": "gemini-2.0-flash-exp",  # Google Gemini 模型（快速）
+    "gemini-pro": "gemini-2.5-pro",  # Google Gemini 模型（准确）
+    "deepseek-r1": "deepseek-r1",  # DeepSeek 模型
 }
 
 # HTTP 请求配置
@@ -32,8 +51,10 @@ DEFAULT_MAX_CONTENT_LENGTH = 500000  # 最大页面内容长度（字符）
 DEFAULT_DELAY = 1  # 请求之间的延迟（秒）
 
 # 结果文件配置
-RESULTS_FILE = "webrtc_scan_results.json"
+RESULTS_FILE_PREFIX = "webrtc_scan_results"  # 结果文件前缀
+RESULTS_FILE_SUFFIX = ".json"  # 结果文件后缀
 PROGRESS_FILE = "webrtc_scan_progress.json"
+BATCH_SIZE = 1000  # 每个文件保存的域名数量
 
 # CSV 文件配置
 DEFAULT_CSV_FILE = "../tranco_top_1m_domains/top-1m.csv"  # 相对于脚本目录
@@ -106,12 +127,12 @@ WEBRTC_KEYWORDS = [
 
 def get_api_key():
     """
-    获取 OpenRouter API Key
+    获取智增增 API Key
     
     Returns:
         API Key 字符串，如果未设置则返回空字符串
     """
-    return OPENROUTER_API_KEY
+    return API_KEY
 
 
 def validate_config():
@@ -121,8 +142,8 @@ def validate_config():
     Returns:
         tuple: (is_valid, error_message)
     """
-    if not OPENROUTER_API_KEY:
-        return False, "OPENROUTER_API_KEY 未设置。请设置环境变量或修改配置文件。"
+    if not API_KEY:
+        return False, "API Key 未设置。请在 .env 文件中设置 API_SECRET_KEY 或 OPENROUTER_API_KEY，或设置环境变量。"
     
     if not DEFAULT_MODEL:
         return False, "DEFAULT_MODEL 未设置。"
@@ -142,9 +163,10 @@ if __name__ == "__main__":
     
     if is_valid:
         print("✅ 配置验证通过")
-        print(f"OpenRouter API URL: {OPENROUTER_API_URL}")
+        print(f"智增增 API Base URL: {API_BASE_URL}")
+        print(f"API 端点: {OPENROUTER_API_URL}")
         print(f"默认模型: {DEFAULT_MODEL}")
-        print(f"API Key: {'已设置' if OPENROUTER_API_KEY else '未设置'}")
+        print(f"API Key: {'已设置' if API_KEY else '未设置'}")
         print(f"超时时间: {DEFAULT_TIMEOUT} 秒")
         print(f"最大内容长度: {DEFAULT_MAX_CONTENT_LENGTH} 字符")
         print(f"请求延迟: {DEFAULT_DELAY} 秒")

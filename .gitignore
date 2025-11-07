@@ -3,9 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# 环境变量文件（包含敏感信息）
+.env
+*.env
+!*.env.example
+
 # 日志文件
 *.log
 scanner_*.log
+
+# JSON 文件
+*.json
+*.json.*
 
 # 进度和结果文件（包含敏感信息）
 webrtc_scanner/webrtc_scan_progress.json
