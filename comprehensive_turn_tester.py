@@ -26,7 +26,8 @@ class ComprehensiveTURNTester:
     def __init__(self, turn_server: str, turn_port: int, username: str, 
                  password: str, realm: str = None, use_tls: bool = False,
                  output_file: str = "turn_test_results.json", reuse_connection: bool = True,
-                 use_short_term_credential: bool = False):
+                 use_short_term_credential: bool = False, ip_file: Optional[str] = None,
+                 port_file: Optional[str] = None):
         self.turn_server = turn_server
         self.turn_port = turn_port
         self.username = username
@@ -36,6 +37,8 @@ class ComprehensiveTURNTester:
         self.output_file = output_file
         self.reuse_connection = reuse_connection
         self.use_short_term_credential = use_short_term_credential
+        self.ip_file = ip_file
+        self.port_file = port_file
         
         # 初始化发现工具
         self.discovery = TURNServerDiscovery()
@@ -51,19 +54,31 @@ class ComprehensiveTURNTester:
     def _load_test_ips(self) -> List[str]:
         """加载测试IP列表"""
         try:
-            with open('standard_test_ips.txt', 'r',encoding="utf-8") as f:
-                return [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+            ip_file = self.ip_file or 'standard_test_ips.txt'
+            with open(ip_file, 'r', encoding="utf-8") as f:
+                ips = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                print(f"[+] 使用测试IP文件: {ip_file}（共 {len(ips)} 条）")
+                return ips
         except FileNotFoundError:
-            print("[-] standard_test_ips.txt not found, using default IPs")
+            if self.ip_file:
+                print(f"[-] 指定的IP文件 {self.ip_file} 未找到，使用默认IP列表")
+            else:
+                print("[-] standard_test_ips.txt not found, using default IPs")
             return ['192.168.1.1', '172.16.0.1']
     
     def _load_test_ports(self) -> List[int]:
         """加载测试端口列表"""
         try:
-            with open('standard_test_ports.txt', 'r',encoding="utf-8") as f:
-                return [int(line.strip()) for line in f if line.strip() and not line.strip().startswith('#')]
+            port_file = self.port_file or 'standard_test_ports.txt'
+            with open(port_file, 'r', encoding="utf-8") as f:
+                ports = [int(line.strip()) for line in f if line.strip() and not line.strip().startswith('#')]
+                print(f"[+] 使用测试端口文件: {port_file}（共 {len(ports)} 条）")
+                return ports
         except FileNotFoundError:
-            print("[-] standard_test_ports.txt not found, using default ports")
+            if self.port_file:
+                print(f"[-] 指定的端口文件 {self.port_file} 未找到，使用默认端口列表")
+            else:
+                print("[-] standard_test_ports.txt not found, using default ports")
             return [80, 443]
     
     def _load_or_init_results(self) -> Dict:
@@ -465,6 +480,8 @@ def main():
     parser.add_argument('--no-reuse-connection', action='store_true', help='为每个端口建立新连接')
     parser.add_argument('--short-term-credential', action='store_true', 
                        help='已弃用：现在自动使用回退机制（先尝试长期凭据，如果400错误则回退为短期凭据）')
+    parser.add_argument('--ip-file', help='自定义测试IP列表文件')
+    parser.add_argument('--port-file', help='自定义测试端口列表文件')
     
     args = parser.parse_args()
     
@@ -486,7 +503,9 @@ def main():
         use_tls=args.tls,
         output_file=args.output,
         reuse_connection=reuse_connection,
-        use_short_term_credential=False  # 不再使用此参数，总是使用回退机制
+        use_short_term_credential=False,  # 不再使用此参数，总是使用回退机制
+        ip_file=args.ip_file,
+        port_file=args.port_file
     )
     
     try:

@@ -8,55 +8,29 @@ import re
 import html
 import time
 import socket
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional, Dict, List
 from bs4 import BeautifulSoup
 import requests
 
 
 def _resolve_domain(domain: str, timeout: float) -> bool:
-    """在给定时间内解析域名"""
+    """在给定时间内解析域名，不使用线程"""
     if timeout <= 0:
         return False
 
-    def _worker():
+    original_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout)
         socket.getaddrinfo(domain, None)
         return True
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_worker)
-        try:
-            return future.result(timeout=timeout)
-        except FuturesTimeoutError:
-            print(f"[!] 解析域名 {domain} 超时 ({timeout:.2f}s)")
-            return False
-        except socket.gaierror as e:
-            print(f"[!] 解析域名 {domain} 失败: {e}")
-            return False
-
-
-def _fetch_url(url: str, connect_timeout: float, read_timeout: float, total_timeout: float):
-    """在线程中执行 HTTP 请求，确保整体超时受控"""
-
-    if total_timeout <= 0:
-        return None
-
-    def _worker():
-        return requests.get(
-            url,
-            headers=REQUEST_HEADERS,
-            timeout=(connect_timeout, read_timeout),
-            allow_redirects=True,
-            verify=False  # 忽略 SSL 证书验证
-        )
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_worker)
-        try:
-            return future.result(timeout=total_timeout)
-        except FuturesTimeoutError:
-            print(f"[!] 请求 {url} 超过总超时 {total_timeout:.2f}s，取消等待")
-            return None
+    except socket.timeout:
+        print(f"[!] 解析域名 {domain} 超时 ({timeout:.2f}s)")
+        return False
+    except socket.gaierror as e:
+        print(f"[!] 解析域名 {domain} 失败: {e}")
+        return False
+    finally:
+        socket.setdefaulttimeout(original_timeout)
 
 # 导入配置文件
 from domain_scanner_config import (
@@ -92,18 +66,29 @@ def fetch_homepage(domain: str) -> Optional[Dict]:
         print(f"[*] 尝试访问 {url} (已耗时 {elapsed:.2f}s，剩余 {remaining_time:.2f}s)")
 
         dns_timeout = min(3.0, remaining_time)
+        dns_start_time = time.monotonic()
         if not _resolve_domain(domain, dns_timeout):
             print(f"[!] DNS 解析 {domain} 失败或超时，跳过 {url}")
             continue
-        print(f"[*] DNS 解析 {domain} 成功，用时 {time.monotonic() - start_time:.2f}s")
+        print(f"[*] DNS 解析 {domain} 成功，用时 {time.monotonic() - dns_start_time:.2f}s")
 
-        connect_timeout = min(3.0, remaining_time)
-        read_timeout = max(0.5, remaining_time - connect_timeout)
+        elapsed_after_dns = time.monotonic() - start_time
+        remaining_after_dns = DEFAULT_TIMEOUT - elapsed_after_dns
+        if remaining_after_dns <= 0:
+            print(f"[!] DNS 解析耗尽剩余时间，停止尝试")
+            break
+
+        connect_timeout = min(3.0, max(0.1, remaining_after_dns))
+        read_timeout = max(0.5, remaining_after_dns - connect_timeout)
 
         try:
-            response = _fetch_url(url, connect_timeout, read_timeout, remaining_time)
-            if response is None:
-                continue
+            response = requests.get(
+                url,
+                headers=REQUEST_HEADERS,
+                timeout=(connect_timeout, read_timeout),
+                allow_redirects=True,
+                verify=False
+            )
             
             # 检查状态码
             if response.status_code == 200:

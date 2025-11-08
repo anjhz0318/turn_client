@@ -289,7 +289,10 @@ def compute_long_term_hmac_key(username, realm, password):
         realm_str = str(realm)
     
     # 使用 OpaqueString 处理 realm 和 password
-    realm_opaque = opaque_string(realm_str).decode('utf-8')
+    if realm_str == '':
+        realm_opaque = ''
+    else:
+        realm_opaque = opaque_string(realm_str).decode('utf-8')
     password_opaque = opaque_string(password).decode('utf-8')
     
     # 拼接：username:realm:password
@@ -934,7 +937,7 @@ def allocate_single_server(server_address, username=None, password=None, realm=N
             server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
             password_algorithms = attrs.get(STUN_ATTR_PASSWORD_ALGORITHMS)  # PASSWORD-ALGORITHMS (可选)
             
-            if not (nonce and server_realm):
+            if nonce is None or server_realm is None:
                 print("[-] No nonce/realm in 401 response, exiting")
                 sock.close()
                 return None
@@ -1235,7 +1238,7 @@ def allocate_single_server_with_alternate(server_address, username=None, passwor
             server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
             password_algorithms = attrs.get(STUN_ATTR_PASSWORD_ALGORITHMS)  # PASSWORD-ALGORITHMS (可选)
             
-            if not (nonce and server_realm):
+            if nonce is None or server_realm is None:
                 print("[-] No nonce/realm in 401 response, exiting")
                 sock.close()
                 return None
@@ -1573,7 +1576,7 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
             # 提取 nonce 和 realm
             nonce = attrs.get(STUN_ATTR_NONCE)   # NONCE
             server_realm = attrs.get(STUN_ATTR_REALM)   # REALM
-            if not (nonce and server_realm):
+            if nonce is None or server_realm is None:
                 print("[-] No nonce/realm in response, exiting")
                 return
 
@@ -1840,7 +1843,7 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
                     nonce = attrs.get(21)
                     server_realm = attrs.get(20)
                     
-                    if nonce and server_realm:
+                    if nonce is not None and server_realm is not None:
                         print(f"[+] Got nonce={nonce}, realm={server_realm}")
                         
                         # 计算完整性密钥
