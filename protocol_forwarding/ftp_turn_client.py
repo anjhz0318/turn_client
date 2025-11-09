@@ -8,6 +8,16 @@ import socket
 import argparse
 import sys
 import re
+import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+TURN_UTILS_DIR = os.path.join(PROJECT_ROOT, "turn_utils")
+
+for path in (PROJECT_ROOT, TURN_UTILS_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
 from turn_utils import (
     allocate_tcp, tcp_connection_bind, tcp_send_data, tcp_receive_data,
     resolve_server_address, resolve_peer_address, tcp_connect

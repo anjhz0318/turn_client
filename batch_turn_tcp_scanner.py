@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-TURN代理批量TCP扫描器
-基于turn_as_proxy_tcp_scanner.py，支持批量扫描多个内网IP的多个TCP端口
+TURN 代理批量 TCP 扫描器
+基于 turn_utils/turn_tcp_port_scanner.py，支持批量扫描多个内网 IP 的多个 TCP 端口
 
 使用方法:
 python batch_turn_tcp_scanner.py --turn-server <TURN服务器> --turn-port <端口> --username <用户名> --password <密码> --targets <IP列表> --ports <端口范围> [--tls] [--workers <线程数>]

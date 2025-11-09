@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """
-TURN代理TCP扫描器
+TURN 代理 TCP 扫描器
 
-本脚本将TURN服务器作为代理，转发TCP扫描流量实现内网探测功能。
-使用TURN服务器的TCP Connect功能进行内网穿透和端口扫描。
+本脚本将 TURN 服务器作为代理，通过 TCP Connect 功能执行内网端口扫描。
 
 使用方法：
-python turn_as_proxy_tcp_scanner.py --turn-server <TURN服务器> --turn-port <端口> --username <用户名> --password <密码> --target <目标IP> --ports <端口范围> [--tls]
+python turn_tcp_port_scanner.py --turn-server <TURN服务器> --turn-port <端口> --username <用户名> --password <密码> --target <目标IP> --ports <端口范围> [--tls]
 """
 
-import sys
 import time
 import socket
 import struct
 import argparse
 import threading
+import os
+import sys
 from typing import List, Tuple, Dict, Optional
 
-# 导入TURN客户端功能
-try:
-    from turn_utils import (
-        allocate_tcp, allocate_tcp_udp, allocate,
-        tcp_connect, tcp_connection_bind,
-        create_permission, channel_bind, channel_data, channel_data_tcp
-    )
-except ImportError:
-    print("❌ 无法导入turn_utils模块，请确保turn_utils包已正确安装")
-    sys.exit(1)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 
+for path in (PROJECT_ROOT, CURRENT_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+try:
+    from turn_client import (
+        resolve_server_address,
+        create_permission,
+        tcp_connect,
+        tcp_connection_bind,
+    )
+    from test_turn_capabilities import allocate_tcp_with_fallback
+except ImportError as e:
+    print(f"❌ 无法导入 TURN 工具模块: {e}")
+    sys.exit(1)
 class TURNScanner:
     """将TURN服务器作为代理进行TCP扫描的客户端"""
     
@@ -55,23 +61,34 @@ class TURNScanner:
         try:
             print(f"[+] 连接到TURN服务器 {self.turn_server}:{self.turn_port}")
             
-            # TCP扫描使用TCP分配
-            result = allocate_tcp(
-                (self.turn_server, self.turn_port), 
-                self.username, 
-                self.password, 
-                self.realm, 
-                self.use_tls, 
-                self.turn_server
+            # 使用具备回退机制的TCP分配逻辑（参考 comprehensive_turn_tester）
+            server_address = resolve_server_address(self.turn_server, self.turn_port)
+            if not server_address:
+                print("❌ 无法解析TURN服务器地址")
+                return False
+            
+            result, is_short_term = allocate_tcp_with_fallback(
+                server_address,
+                self.username,
+                self.password,
+                self.realm,
+                self.use_tls
             )
             
-            if result:
-                self.control_sock, self.nonce, self.realm, self.integrity_key, self.actual_server_address = result
-                print(f"✅ TURN连接成功 (实际服务器: {self.actual_server_address})")
-                return True
-            else:
-                print("❌ TURN连接失败")
+            if not result:
+                print("❌ TURN分配失败")
                 return False
+            
+            self.control_sock, self.nonce, self.realm, self.integrity_key, self.actual_server_address, *extra = result
+            self.mi_algorithm = extra[0] if extra else None
+            
+            if is_short_term:
+                print("✅ TURN连接成功 (使用短期凭证)")
+            else:
+                print("✅ TURN连接成功 (使用长期凭证)")
+            
+            print(f"   ↳ 实际服务器: {self.actual_server_address}")
+            return True
                 
         except Exception as e:
             print(f"❌ TURN连接异常: {e}")
@@ -85,7 +102,7 @@ class TURNScanner:
             # 创建权限
             if not create_permission(
                 self.control_sock, self.nonce, self.realm, self.integrity_key,
-                target_ip, target_port, self.actual_server_address, self.username
+                target_ip, target_port, self.actual_server_address, self.username, self.mi_algorithm
             ):
                 print(f"❌ 创建权限失败: {target_ip}:{target_port}")
                 return False
@@ -93,7 +110,7 @@ class TURNScanner:
             # 发起TCP连接
             connection_id = tcp_connect(
                 self.control_sock, self.nonce, self.realm, self.integrity_key,
-                target_ip, target_port, self.username
+                target_ip, target_port, self.username, self.mi_algorithm
             )
             
             if not connection_id:
@@ -110,7 +127,7 @@ class TURNScanner:
                 # 绑定数据连接
                 if tcp_connection_bind(
                     data_sock, self.nonce, self.realm, self.integrity_key,
-                    connection_id, self.actual_server_address, self.username
+                    connection_id, self.actual_server_address, self.username, self.mi_algorithm
                 ):
                     print(f"✅ TCP端口开放: {target_ip}:{target_port}")
                     return True

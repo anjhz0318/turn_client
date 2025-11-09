@@ -11,8 +11,13 @@ import socket
 import sys
 from typing import Optional
 
-# 添加 turn_utils 到路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'turn_utils'))
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+TURN_UTILS_DIR = os.path.join(PROJECT_ROOT, "turn_utils")
+
+for path in (PROJECT_ROOT, TURN_UTILS_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 from turn_utils import (
     resolve_server_address,

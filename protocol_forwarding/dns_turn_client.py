@@ -7,9 +7,18 @@ import socket
 import struct
 import time
 import argparse
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+TURN_UTILS_DIR = os.path.join(PROJECT_ROOT, "turn_utils")
+
+for path in (PROJECT_ROOT, TURN_UTILS_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
 from turn_utils import (
-    allocate, 
-    allocate_tcp_udp,
     create_permission, 
     channel_bind, 
     channel_data,
@@ -28,7 +37,7 @@ class DNSTURNClient:
         self.turn_port = turn_port
         self.username = username
         self.password = password
-        self.realm = realm
+        self.auth_realm = realm
         self.use_tcp_udp = use_tcp_udp
         self.use_tls = use_tls
         self.sock = None
@@ -36,6 +45,9 @@ class DNSTURNClient:
         self.realm = None
         self.integrity_key = None
         self.channel_number = 0x4000  # 通道号（必须在0x4000-0x4FFF范围内）
+        self.actual_server_address = None
+        self.mi_algorithm = None
+        self.is_short_term = None
         
     def connect(self):
         """建立UDP TURN连接"""
@@ -52,34 +64,51 @@ class DNSTURNClient:
         
         print(f"[+] Using TURN server: {server_address}")
         
-        # 1. 分配TURN资源
+        # 1. 分配TURN资源（带回退机制）
         if self.use_tcp_udp:
-            result = allocate_tcp_udp(server_address, self.username, self.password, self.realm, self.use_tls, self.turn_server)
-            if not result:
-                print("[-] Failed to allocate TCP+UDP TURN relay")
-                return False
+            from test_turn_capabilities import allocate_tcp_udp_with_fallback
+            result, is_short_term = allocate_tcp_udp_with_fallback(
+                server_address,
+                self.username,
+                self.password,
+                self.auth_realm,
+                self.turn_server,
+                self.use_tls,
+            )
         else:
-            result = allocate(server_address, self.username, self.password, self.realm)
-            if not result:
-                print("[-] Failed to allocate UDP TURN relay")
-                return False
-            
-        self.sock, self.nonce, self.realm, self.integrity_key, self.actual_server_address = result
-        if self.use_tcp_udp:
-            print("[+] TCP+UDP TURN allocation successful")
+            from test_turn_capabilities import allocate_with_fallback
+            result, is_short_term = allocate_with_fallback(
+                server_address,
+                self.username,
+                self.password,
+                self.auth_realm,
+                self.turn_server,
+            )
+
+        if not result:
+            print("[-] Failed to allocate TURN relay")
+            return False
+
+        self.sock, self.nonce, self.realm, self.integrity_key, self.actual_server_address, *extra = result
+        self.mi_algorithm = extra[0] if extra else None
+        self.is_short_term = is_short_term
+
+        if self.is_short_term:
+            print("[+] TURN allocation successful (short-term credential)")
         else:
-            print("[+] UDP TURN allocation successful")
+            print("[+] TURN allocation successful (long-term credential)")
+        print(f"[+] Relay address: {self.actual_server_address}")
         
         # 2. 创建权限，允许向DNS服务器发送数据
         if not create_permission(self.sock, self.nonce, self.realm, self.integrity_key, 
-                               self.dns_server_ip, self.dns_server_port, self.actual_server_address, self.username):
+                               self.dns_server_ip, self.dns_server_port, self.actual_server_address, self.username, self.mi_algorithm):
             print("[-] Failed to create permission")
             self.sock.close()
             return False
             
         # 3. 绑定通道
         if not channel_bind(self.sock, self.nonce, self.realm, self.integrity_key, 
-                          self.dns_server_ip, self.dns_server_port, self.channel_number, self.actual_server_address, self.username):
+                          self.dns_server_ip, self.dns_server_port, self.channel_number, self.actual_server_address, self.username, self.mi_algorithm):
             print("[-] Failed to bind channel")
             self.sock.close()
             return False

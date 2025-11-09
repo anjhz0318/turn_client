@@ -9,12 +9,22 @@ import ssl
 import argparse
 import sys
 import os
+import base64
+import hashlib
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+TURN_UTILS_DIR = os.path.join(PROJECT_ROOT, "turn_utils")
+
+for path in (PROJECT_ROOT, TURN_UTILS_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
 from turn_utils import (
     allocate_tcp, tcp_connection_bind, tcp_send_data, tcp_receive_data,
     resolve_server_address, resolve_peer_address, tcp_connect
 )
 # 导入回退机制函数和权限创建函数（参考 comprehensive_turn_tester）
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'turn_utils'))
 from test_turn_capabilities import allocate_tcp_with_fallback
 from turn_client import create_permission
 from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
@@ -178,7 +188,17 @@ class HTTPTURNClient:
                 self.data_sock.close()
             return False
     
-    def send_http_request(self, method="GET", path="/", headers=None, body=None, http_version="1.1", custom_request=None):
+    def send_http_request(
+        self,
+        method="GET",
+        path="/",
+        headers=None,
+        body=None,
+        http_version="1.1",
+        custom_request=None,
+        websocket=False,
+        websocket_key=None
+    ):
         """发送HTTP请求 - 支持完全自定义的HTTP请求"""
         if not self.connected:
             print("[-] Not connected")
@@ -202,20 +222,49 @@ class HTTPTURNClient:
             else:
                 host_header = f"{self.target_host}:{self.target_port}" if self.target_port != 80 else self.target_host
             
+            # WebSocket 模式下强制使用GET
+            if websocket and method.upper() != "GET":
+                print("[!] WebSocket 模式仅支持 GET 方法，已自动改为 GET")
+                method = "GET"
+
+            # WebSocket 模式默认头部
+            header_map = {}
+            if headers:
+                for key, value in headers.items():
+                    header_map[str(key).lower()] = (str(key), str(value))
+            
+            ws_key = None
+            if websocket:
+                ws_key = websocket_key or base64.b64encode(os.urandom(16)).decode("ascii")
+                websocket_defaults = {
+                    "Upgrade": "websocket",
+                    "Connection": "Upgrade",
+                    "Sec-WebSocket-Version": "13",
+                    "Sec-WebSocket-Key": ws_key,
+                }
+                for key, value in websocket_defaults.items():
+                    key_lower = key.lower()
+                    if key_lower not in header_map:
+                        header_map[key_lower] = (key, value)
+                # 如果未指定Origin，则根据HTTP/HTTPS推导
+                if "origin" not in header_map:
+                    scheme = "https" if self.use_https else "http"
+                    origin_value = f"{scheme}://{host_header}"
+                    header_map["origin"] = ("Origin", origin_value)
+                # 更新 ws_key 为最终请求中使用的值
+                ws_key = header_map["sec-websocket-key"][1]
+            
             # 构建请求行
             request_line = f"{method} {path} HTTP/{http_version}"
             
             # 构建请求头
-            request_headers = []
-            request_headers.append(f"Host: {host_header}")
-            
-            # 添加自定义头部
-            if headers:
-                for key, value in headers.items():
-                    request_headers.append(f"{key}: {value}")
+            body_bytes = None
+            request_headers = [f"Host: {host_header}"]
+            for _, (orig_key, value) in header_map.items():
+                request_headers.append(f"{orig_key}: {value}")
             
             # 添加Content-Length（如果有body）
-            if body:
+            if body and not websocket:
                 if isinstance(body, str):
                     body_bytes = body.encode('utf-8')
                 else:
@@ -226,7 +275,7 @@ class HTTPTURNClient:
             request = request_line + "\r\n" + "\r\n".join(request_headers) + "\r\n\r\n"
             
             # 添加请求体
-            if body:
+            if body and not websocket:
                 if isinstance(body, str):
                     request += body
                 else:
@@ -236,7 +285,7 @@ class HTTPTURNClient:
             print(f"    {request_line}")
             for header in request_headers:
                 print(f"    {header}")
-            if body:
+            if body and not websocket:
                 body_preview = str(body)[:100] + "..." if len(str(body)) > 100 else str(body)
                 print(f"    Body: {body_preview}")
         
@@ -248,12 +297,15 @@ class HTTPTURNClient:
                 
             print("[+] HTTP request sent successfully")
             
-            # 接收完整响应
+            # 接收响应
             print("[+] Waiting for HTTP response...")
-            response_data = self._receive_complete_response()
+            response_data = self._receive_complete_response(stop_after_headers=websocket)
             if response_data:
-                print(f"[+] Received complete response ({len(response_data)} bytes)")
-                return response_data.decode('utf-8', errors='ignore')
+                print(f"[+] Received response ({len(response_data)} bytes)")
+                response_text = response_data.decode('utf-8', errors='ignore')
+                if websocket:
+                    return self._process_websocket_handshake(response_text, ws_key)
+                return response_text
             else:
                 print("[-] No response received")
                 return None
@@ -262,7 +314,7 @@ class HTTPTURNClient:
             print(f"[-] Request failed: {e}")
             return None
     
-    def _receive_complete_response(self):
+    def _receive_complete_response(self, stop_after_headers=False):
         """接收完整的HTTP响应"""
         try:
             # 设置较长的超时时间
@@ -285,7 +337,9 @@ class HTTPTURNClient:
                     # 检查是否收到完整的响应头
                     if b"\r\n\r\n" in response_data:
                         header_complete = True
-                        
+                        if stop_after_headers:
+                            break
+
                         # 解析Content-Length
                         header_text = response_data[:response_data.find(b"\r\n\r\n")].decode('utf-8', errors='ignore')
                         for line in header_text.split('\r\n'):
@@ -327,6 +381,10 @@ class HTTPTURNClient:
             header_end = response_data.find(b"\r\n\r\n") + 4
             body_received = len(response_data) - header_end
             
+            if stop_after_headers:
+                print("[+] Headers received，WebSocket模式下停止读取响应体")
+                return response_data
+
             print(f"[+] Headers complete, body received: {body_received}/{content_length or 'unknown'}")
             
             # 如果有Content-Length，继续接收直到完整
@@ -364,6 +422,56 @@ class HTTPTURNClient:
             if response_data:
                 print(f"[+] Returning {len(response_data)} bytes already received")
             return response_data if response_data else None
+
+    def _process_websocket_handshake(self, response_text, websocket_key):
+        """解析并验证WebSocket握手响应"""
+        lines = response_text.split("\r\n")
+        status_line = lines[0] if lines else ""
+        status_code = None
+        if status_line.startswith("HTTP/"):
+            try:
+                status_code = int(status_line.split()[1])
+            except (IndexError, ValueError):
+                status_code = None
+
+        headers = {}
+        for line in lines[1:]:
+            if not line:
+                break
+            if ":" in line:
+                key, value = line.split(":", 1)
+                headers[key.strip()] = value.strip()
+
+        header_lower = {k.lower(): v for k, v in headers.items()}
+        accept_value = header_lower.get("sec-websocket-accept")
+
+        expected_accept = None
+        handshake_ok = False
+        if websocket_key:
+            magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            accept_bytes = hashlib.sha1((websocket_key + magic).encode("ascii")).digest()
+            expected_accept = base64.b64encode(accept_bytes).decode("ascii")
+            handshake_ok = (status_code == 101 and accept_value == expected_accept)
+        else:
+            handshake_ok = status_code == 101
+
+        print("=== WebSocket Handshake Result ===")
+        print(f"Status Line: {status_line or '<empty>'}")
+        print(f"Sec-WebSocket-Accept: {accept_value or '<missing>'}")
+        if expected_accept:
+            print(f"Expected Accept: {expected_accept}")
+        print(f"Handshake Verification: {'SUCCESS' if handshake_ok else 'FAILED'}")
+
+        return {
+            "status_line": status_line,
+            "status_code": status_code,
+            "headers": headers,
+            "sec_websocket_accept": accept_value,
+            "expected_accept": expected_accept,
+            "handshake_ok": handshake_ok,
+            "websocket_key": websocket_key,
+            "raw_response": response_text,
+        }
     
     def get_ssl_info(self):
         """获取SSL连接信息"""
@@ -540,6 +648,9 @@ def main():
     parser.add_argument("--content-type", help="Content-Type header")
     parser.add_argument("--accept", help="Accept header")
     parser.add_argument("--authorization", help="Authorization header (e.g., 'Bearer token' or 'Basic base64')")
+    parser.add_argument("--websocket", action="store_true", help="Perform WebSocket handshake instead of standard HTTP request")
+    parser.add_argument("--websocket-key", help="Custom Sec-WebSocket-Key value for WebSocket handshake")
+    parser.add_argument("--websocket-origin", help="Override Origin header for WebSocket handshake")
     
     args = parser.parse_args()
     
@@ -560,6 +671,8 @@ def main():
         headers['Accept'] = args.accept
     if args.authorization:
         headers['Authorization'] = args.authorization
+    if args.websocket_origin:
+        headers['Origin'] = args.websocket_origin
     
     # 处理自定义请求
     custom_request = None
@@ -586,6 +699,17 @@ def main():
         # 只处理没有 CRLF 的情况
         if '\r\n' not in custom_request and '\n' in custom_request:
             custom_request = custom_request.replace('\n', '\r\n')
+    
+    if args.websocket:
+        if custom_request:
+            print("[-] WebSocket 模式下不支持 --custom-request 或 --request-file")
+            return 1
+        if args.method.upper() != "GET":
+            print("[!] WebSocket 模式仅支持 GET 方法，已自动改为 GET")
+            args.method = "GET"
+        if args.body:
+            print("[!] WebSocket 握手不应包含请求体，已忽略 --body 参数")
+            args.body = None
     
     # 设置默认端口
     if args.https and args.target_port == 80:
@@ -630,6 +754,8 @@ def main():
     print(f"TURN Server: {args.turn_server or DEFAULT_TURN_SERVER}:{args.turn_port or DEFAULT_TURN_PORT}")
     print(f"Method: {args.method}")
     print(f"Path: {args.path}")
+    if args.websocket:
+        print("Mode: WebSocket handshake")
     
     # 创建客户端
     client = HTTPTURNClient(
@@ -659,29 +785,40 @@ def main():
             headers=headers,
             body=args.body,
             http_version=args.http_version,
-            custom_request=custom_request
+            custom_request=custom_request,
+            websocket=args.websocket,
+            websocket_key=args.websocket_key
         )
         
         if response:
-            print("\n=== HTTP Response ===")
-            print(response)
-            
-            # 显示SSL证书信息
-            if args.https and args.show_cert_info and client.get_ssl_info():
-                ssl_info = client.get_ssl_info()
-                if ssl_info['peer_cert']:
-                    print("\n=== SSL Certificate Information ===")
-                    cert = ssl_info['peer_cert']
-                    print(f"Subject: {cert.get('subject', 'Unknown')}")
-                    print(f"Issuer: {cert.get('issuer', 'Unknown')}")
-                    print(f"Serial Number: {cert.get('serialNumber', 'Unknown')}")
-                    print(f"Version: {cert.get('version', 'Unknown')}")
-                    if 'notBefore' in cert:
-                        print(f"Valid From: {cert['notBefore']}")
-                    if 'notAfter' in cert:
-                        print(f"Valid Until: {cert['notAfter']}")
-                    if 'subjectAltName' in cert:
-                        print(f"Subject Alternative Names: {cert['subjectAltName']}")
+            if args.websocket:
+                print("\n=== WebSocket Raw Response ===")
+                raw = response.get("raw_response", "")
+                print(raw if raw else "<empty response>")
+                if not response.get("handshake_ok"):
+                    print("[-] WebSocket handshake verification failed")
+                    return 1
+                print("[+] WebSocket handshake verification succeeded")
+            else:
+                print("\n=== HTTP Response ===")
+                print(response)
+                
+                # 显示SSL证书信息
+                if args.https and args.show_cert_info and client.get_ssl_info():
+                    ssl_info = client.get_ssl_info()
+                    if ssl_info['peer_cert']:
+                        print("\n=== SSL Certificate Information ===")
+                        cert = ssl_info['peer_cert']
+                        print(f"Subject: {cert.get('subject', 'Unknown')}")
+                        print(f"Issuer: {cert.get('issuer', 'Unknown')}")
+                        print(f"Serial Number: {cert.get('serialNumber', 'Unknown')}")
+                        print(f"Version: {cert.get('version', 'Unknown')}")
+                        if 'notBefore' in cert:
+                            print(f"Valid From: {cert['notBefore']}")
+                        if 'notAfter' in cert:
+                            print(f"Valid Until: {cert['notAfter']}")
+                        if 'subjectAltName' in cert:
+                            print(f"Subject Alternative Names: {cert['subjectAltName']}")
         else:
             print("[-] No response received")
             return 1
