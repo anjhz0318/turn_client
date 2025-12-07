@@ -20,6 +20,7 @@ import struct
 import threading
 import time
 import queue
+import csv
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 import sys
@@ -58,16 +59,18 @@ class TURNIPScanner:
                 with open(self.output_file, 'r') as f:
                     return json.load(f)
             except Exception as e:
-                print(f"[-] 无法加载结果文件: {e}")
+                print(f"[-] 无法加载结果文件: {e}", flush=True)
         return {}
     
     def _save_results(self):
         """保存结果到文件"""
         try:
+            # 确保所有数据都是JSON可序列化的
+            serializable_results = make_json_serializable(self.results)
             with open(self.output_file, 'w') as f:
-                json.dump(self.results, f, indent=2)
+                json.dump(serializable_results, f, indent=2)
         except Exception as e:
-            print(f"[-] 保存结果失败: {e}")
+            print(f"[-] 保存结果失败: {e}", flush=True)
     
     def _update_last_scanned_ip(self, ip: str):
         """更新最后扫描的IP地址（线程安全）"""
@@ -82,7 +85,7 @@ class TURNIPScanner:
                 with open(self.output_file, 'w') as f:
                     json.dump(self.results, f, indent=2)
         except Exception as e:
-            print(f"[!] 更新最后扫描IP失败: {e}")
+            print(f"[!] 更新最后扫描IP失败: {e}", flush=True)
     
     def _ip_to_int(self, ip: str) -> int:
         """将IP地址转换为整数（用于比较）"""
@@ -664,7 +667,8 @@ class TURNIPScanner:
     
     def scan_ip(self, ip: str) -> Dict:
         """扫描单个IP地址"""
-        print(f"[*] 扫描 {ip}...")
+        # 移除每个IP的扫描输出，减少输出频率
+        # print(f"[*] 扫描 {ip}...", flush=True)
         
         result = {
             'ip': ip,
@@ -689,66 +693,122 @@ class TURNIPScanner:
         # 测试TCP 5349（先TLS，失败再纯TCP）
         result['tcp_5349'] = self._test_tcp_turn(ip, 5349, use_tls=True)
         
-        # 检查是否有任何TURN响应（成功或错误响应都算）
+        # 检查是否有任何TURN响应（成功或错误响应都算，但不包括连接错误）
         has_turn_response = False
         for test_result in [result['udp_3478'], result['tcp_3478'], result['tcp_443'], result['tcp_5349']]:
-            if test_result and (test_result.get('success') is not None or 
-                              test_result.get('realm') or 
-                              test_result.get('banner') or 
-                              test_result.get('error')):
+            if self._is_turn_response(test_result):
                 has_turn_response = True
                 break
         
         # 如果发现TURN服务器，查询rDNS和whois
         if has_turn_response:
-            print(f"[+] 发现TURN服务器: {ip}")
+            print(f"[+] 发现TURN服务器: {ip}", flush=True)
             result['rdns'] = self._query_rdns(ip)
             result['whois'] = self._query_whois(ip)
         
         return result
     
+    def _is_stun_error(self, error: Optional[str]) -> bool:
+        """判断error是否是STUN协议错误（而非连接错误）"""
+        if not error:
+            return False
+        # STUN错误码格式通常是 "4XX Reason" 或 "XXX Reason"
+        # 连接错误通常是 "[Errno XXX] ..." 或包含 "Connection", "timeout", "refused" 等
+        error_lower = error.lower()
+        connection_errors = ['connection refused', 'connection reset', 'connection aborted', 
+                            'timeout', 'errno', 'network is unreachable', 'no route to host',
+                            'name or service not known', 'nodename nor servname provided']
+        if any(conn_err in error_lower for conn_err in connection_errors):
+            return False
+        # 如果error看起来像STUN错误码（如 "401 Unauthorized", "400 Bad Request"）
+        # 或者包含常见的STUN错误原因
+        if error.startswith(('4', '3', '5', '6')) and len(error) > 3:
+            # 可能是STUN错误码
+            return True
+        return False
+    
     def _is_turn_response(self, result: Optional[Dict]) -> bool:
         """判断是否为TURN响应（成功或错误响应都算）"""
         if not result:
             return False
-        # 如果有realm、banner或明确的success/error，说明是TURN响应
-        return result.get('success') is not None or result.get('realm') or result.get('banner') or result.get('error')
+        # 如果有realm或banner，肯定是TURN响应
+        if result.get('realm') or result.get('banner'):
+            return True
+        # 如果success为True，肯定是TURN响应
+        if result.get('success') is True:
+            return True
+        # 如果error是STUN协议错误（而非连接错误），也算TURN响应
+        error = result.get('error')
+        if error and self._is_stun_error(error):
+            return True
+        # 其他情况（连接错误等）不算TURN响应
+        return False
     
     def scan_all_ips(self):
         """扫描所有IPv4地址空间"""
-        print("[+] 开始扫描所有IPv4地址空间...")
-        print(f"[+] 使用 {self.threads} 个线程")
+        import sys
+        sys.stdout.flush()  # 强制刷新输出缓冲区
+        
+        print("[+] 开始扫描所有IPv4地址空间...", flush=True)
+        print(f"[+] 使用 {self.threads} 个线程", flush=True)
         
         # 获取最后扫描的IP地址
         last_scanned_ip = self._get_last_scanned_ip()
         start_ip_int = 0
         if last_scanned_ip:
             start_ip_int = self._ip_to_int(last_scanned_ip) + 1
-            print(f"[+] 从上次中断处继续: {last_scanned_ip} -> {self._int_to_ip(start_ip_int)}")
+            print(f"[+] 从上次中断处继续: {last_scanned_ip} -> {self._int_to_ip(start_ip_int)}", flush=True)
         else:
-            print("[+] 从头开始扫描")
+            print("[+] 从头开始扫描", flush=True)
         
-        # 创建任务队列
-        task_queue = queue.Queue()
-        
-        # 生成所有IPv4地址（从start_ip_int开始）
+        # 计算总数和跳过的数量
         total_ips = 256 * 256 * 256 * 256
         skipped_count = 0
-        for a in range(256):
-            for b in range(256):
-                for c in range(256):
-                    for d in range(256):
-                        ip = f"{a}.{b}.{c}.{d}"
-                        ip_int = self._ip_to_int(ip)
-                        if ip_int < start_ip_int:
-                            skipped_count += 1
-                            continue
-                        task_queue.put(ip)
+        if start_ip_int > 0:
+            skipped_count = start_ip_int
         
-        print(f"[+] 总共需要扫描 {total_ips} 个IP地址")
+        print(f"[+] 总共需要扫描 {total_ips} 个IP地址", flush=True)
         if skipped_count > 0:
-            print(f"[+] 跳过已扫描的 {skipped_count} 个IP地址")
-            print(f"[+] 剩余 {total_ips - skipped_count} 个IP地址待扫描")
+            print(f"[+] 跳过已扫描的 {skipped_count} 个IP地址", flush=True)
+            print(f"[+] 剩余 {total_ips - skipped_count} 个IP地址待扫描", flush=True)
+        
+        # 创建任务队列（限制队列大小，避免内存占用过大）
+        task_queue = queue.Queue(maxsize=100000)  # 最多缓存10万个任务
+        producer_done = threading.Event()  # 生产者完成标志
+        
+        # IP地址生成器
+        def ip_generator():
+            """生成IP地址的生成器"""
+            for a in range(256):
+                for b in range(256):
+                    for c in range(256):
+                        for d in range(256):
+                            ip = f"{a}.{b}.{c}.{d}"
+                            ip_int = self._ip_to_int(ip)
+                            if ip_int >= start_ip_int:
+                                yield ip
+        
+        # 生产者线程：将IP地址放入队列
+        def producer():
+            """生产者线程，将IP地址放入队列"""
+            count = 0
+            try:
+                for ip in ip_generator():
+                    # 如果IP已经扫描过，跳过
+                    if ip in self.results and ip != '_metadata':
+                        continue
+                    task_queue.put(ip)
+                    count += 1
+                    # 每生成10万个IP输出一次进度
+                    if count % 100000 == 0:
+                        print(f"[*] 已生成 {count} 个任务到队列...", flush=True)
+                print(f"[+] IP地址生成完成，共 {count} 个任务", flush=True)
+            finally:
+                producer_done.set()  # 标记生产者完成
+        
+        # 启动生产者线程
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
         
         # 工作线程
         def worker():
@@ -777,18 +837,115 @@ class TURNIPScanner:
                             self.results[ip] = result
                             self.found_count += 1
                             self._save_results()
-                            print(f"[+] 已发现 {self.found_count} 个TURN服务器")
+                            print(f"[+] 已发现 {self.found_count} 个TURN服务器", flush=True)
                     
                     # 每扫描1000个IP打印一次进度
                     if self.scan_count % 1000 == 0:
                         remaining = total_ips - skipped_count - self.scan_count
-                        print(f"[*] 进度: {self.scan_count}/{total_ips - skipped_count} (已扫描: {self.scan_count + skipped_count}/{total_ips}, {100*(self.scan_count + skipped_count)/total_ips:.2f}%), 已发现: {self.found_count}, 剩余: {remaining}")
+                        print(f"[*] 进度: {self.scan_count}/{total_ips - skipped_count} (已扫描: {self.scan_count + skipped_count}/{total_ips}, {100*(self.scan_count + skipped_count)/total_ips:.2f}%), 已发现: {self.found_count}, 剩余: {remaining}", flush=True)
+                    
+                    task_queue.task_done()
+                except queue.Empty:
+                    # 如果队列为空且生产者已完成，则退出
+                    if producer_done.is_set() and task_queue.empty():
+                        break
+                    # 否则继续等待
+                    continue
+                except Exception as e:
+                    print(f"[-] 线程错误: {e}", flush=True)
+                    task_queue.task_done()
+        
+        # 启动线程
+        threads = []
+        for i in range(self.threads):
+            t = threading.Thread(target=worker)
+            t.start()
+            threads.append(t)
+        
+        # 等待生产者线程完成
+        producer_thread.join()
+        
+        # 等待所有任务完成
+        task_queue.join()
+        
+        # 等待所有线程完成
+        for t in threads:
+            t.join()
+        
+        print("\n" + "="*70, flush=True)
+        print("📊 扫描完成", flush=True)
+        print("="*70, flush=True)
+        print(f"总共扫描: {self.scan_count} 个IP地址", flush=True)
+        print(f"发现TURN服务器: {self.found_count} 个", flush=True)
+        print(f"结果已保存到: {self.output_file}", flush=True)
+    
+    def scan_ips_from_csv(self, csv_file: str):
+        """从CSV文件读取IP列表并多线程扫描"""
+        print(f"[+] 从CSV文件读取IP列表: {csv_file}", flush=True)
+        
+        # 读取CSV文件，提取IP列（第二列，索引1）
+        ip_list = []
+        try:
+            with open(csv_file, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)  # 跳过表头
+                for row in reader:
+                    if len(row) > 1:
+                        ip = row[1].strip()  # IP列是第二列（索引1）
+                        if ip and ip not in ip_list:  # 去重
+                            ip_list.append(ip)
+        except Exception as e:
+            print(f"[-] 读取CSV文件失败: {e}", flush=True)
+            return
+        
+        total_ips = len(ip_list)
+        print(f"[+] 从CSV文件读取到 {total_ips} 个唯一IP地址", flush=True)
+        print(f"[+] 使用 {self.threads} 个线程", flush=True)
+        
+        # 创建任务队列
+        task_queue = queue.Queue()
+        for ip in ip_list:
+            task_queue.put(ip)
+        
+        # 工作线程
+        def worker():
+            while True:
+                try:
+                    ip = task_queue.get(timeout=1)
+                    self.scan_count += 1
+                    
+                    # 如果IP已经扫描过（且不是元数据字段），跳过
+                    if ip in self.results and ip != '_metadata':
+                        task_queue.task_done()
+                        continue
+                    
+                    # 扫描IP
+                    result = self.scan_ip(ip)
+                    
+                    # 更新最后扫描的IP地址（实时更新，线程安全）
+                    self._update_last_scanned_ip(ip)
+                    
+                    # 如果发现TURN服务器，保存结果
+                    if self._is_turn_response(result.get('udp_3478')) or \
+                       self._is_turn_response(result.get('tcp_3478')) or \
+                       self._is_turn_response(result.get('tcp_443')) or \
+                       self._is_turn_response(result.get('tcp_5349')):
+                        with self.lock:
+                            self.results[ip] = result
+                            self.found_count += 1
+                            self._save_results()
+                            print(f"[+] 已发现 {self.found_count} 个TURN服务器: {ip}", flush=True)
+                    
+                    # 每扫描100个IP打印一次进度
+                    if self.scan_count % 100 == 0:
+                        remaining = total_ips - self.scan_count
+                        print(f"[*] 进度: {self.scan_count}/{total_ips} ({100*self.scan_count/total_ips:.2f}%), 已发现: {self.found_count}, 剩余: {remaining}", flush=True)
                     
                     task_queue.task_done()
                 except queue.Empty:
                     break
                 except Exception as e:
-                    print(f"[-] 线程错误: {e}")
+                    print(f"[-] 线程错误: {e}", flush=True)
                     task_queue.task_done()
         
         # 启动线程
@@ -805,23 +962,36 @@ class TURNIPScanner:
         for t in threads:
             t.join()
         
-        print("\n" + "="*70)
-        print("📊 扫描完成")
-        print("="*70)
-        print(f"总共扫描: {self.scan_count} 个IP地址")
-        print(f"发现TURN服务器: {self.found_count} 个")
-        print(f"结果已保存到: {self.output_file}")
+        print("\n" + "="*70, flush=True)
+        print("📊 扫描完成", flush=True)
+        print("="*70, flush=True)
+        print(f"总共扫描: {self.scan_count} 个IP地址", flush=True)
+        print(f"发现TURN服务器: {self.found_count} 个", flush=True)
+        print(f"结果已保存到: {self.output_file}", flush=True)
+
+def make_json_serializable(obj):
+    """递归地将对象转换为JSON可序列化的格式"""
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    elif isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_serializable(item) for item in obj]
+    else:
+        # 对于其他类型（如IPv4Address, IPv6Address等），转换为字符串
+        return str(obj)
 
 def main():
     parser = argparse.ArgumentParser(description='TURN服务器IP地址空间扫描工具')
     parser.add_argument('--ip', help='测试单个IP地址')
     parser.add_argument('--scan-all', action='store_true', help='扫描所有IPv4地址空间')
+    parser.add_argument('--csv', help='从CSV文件读取IP列表并多线程扫描')
     parser.add_argument('--output', default='turn_scan_results.json', help='输出文件路径')
     parser.add_argument('--threads', type=int, default=10, help='线程数（默认10）')
     
     args = parser.parse_args()
     
-    if not args.ip and not args.scan_all:
+    if not args.ip and not args.scan_all and not args.csv:
         parser.print_help()
         return
     
@@ -830,6 +1000,8 @@ def main():
     if args.ip:
         # 单IP测试模式
         result = scanner.scan_ip(args.ip)
+        # 确保结果可序列化
+        result = make_json_serializable(result)
         print("\n" + "="*70)
         print("📊 扫描结果")
         print("="*70)
@@ -838,6 +1010,9 @@ def main():
         # 保存结果
         scanner.results[args.ip] = result
         scanner._save_results()
+    elif args.csv:
+        # CSV文件模式
+        scanner.scan_ips_from_csv(args.csv)
     else:
         # 全IPv4扫描模式
         scanner.scan_all_ips()

@@ -23,6 +23,9 @@ webrtc_scanner/webrtc_scan_results.json
 # 大型数据文件
 tranco_top_1m_domains/
 
+# CSV 文件
+*.csv
+
 # PID 文件
 *.pid
 scanner.pid
