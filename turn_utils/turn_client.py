@@ -1451,7 +1451,7 @@ def allocate(server_address=None, username=None, password=None, realm=None, serv
     return None
 
 
-def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, use_short_term_credential=False):
+def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, use_short_term_credential=False, sni_hostname=None):
     """向单个服务器分配TCP TURN中继地址（使用TCP传输）
     
     Args:
@@ -1461,6 +1461,7 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
         realm: 认证域（长期凭证需要）
         use_tls: 是否使用TLS
         use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+        sni_hostname: 自定义SNI主机名（用于TLS握手，如果为None则使用server_address[0]）
     """
     # 使用传入的认证信息或默认值
     auth_username = username or USERNAME
@@ -1480,9 +1481,35 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
             import ssl
             print("[+] Establishing TLS connection...")
             context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            control_sock = context.wrap_socket(control_sock, server_hostname=server_address[0])
+            
+            # 确定SNI主机名
+            if sni_hostname:
+                ssl_hostname = sni_hostname
+                print(f"[+] Using custom SNI hostname: {ssl_hostname}")
+            else:
+                ssl_hostname = server_address[0]
+            
+            # 证书验证逻辑：
+            # - 如果指定了SNI，默认开启证书验证
+            # - 如果未指定SNI（使用IP），默认关闭证书验证
+            if sni_hostname:
+                # 指定了SNI，检查是否是IP地址
+                try:
+                    socket.inet_aton(ssl_hostname)
+                    # SNI是IP地址，禁用证书验证
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    print("[!] SNI hostname is an IP address, SSL certificate verification disabled")
+                except socket.error:
+                    # SNI是域名，启用证书验证（默认行为）
+                    print(f"[+] Using custom SNI '{sni_hostname}', SSL certificate verification enabled")
+            else:
+                # 未指定SNI，使用IP地址，禁用证书验证
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                print("[!] No SNI specified (using IP address), SSL certificate verification disabled")
+            
+            control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
             print("[+] TLS connection established")
         
         if use_short_term_credential:
@@ -1629,7 +1656,7 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
                             print(f"[+] Found alternate server: {alt_addr[0]}:{alt_addr[1]}")
                             control_sock.close()
                             # 递归调用使用备用服务器
-                            return allocate_tcp_single_server(alt_addr, username, password, realm, use_tls, use_short_term_credential)
+                            return allocate_tcp_single_server(alt_addr, username, password, realm, use_tls, use_short_term_credential, sni_hostname=None)
                         else:
                             print("[-] Failed to parse alternate server address")
                     else:
@@ -1652,7 +1679,7 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
         control_sock.close()
         return None
 
-def allocate_tcp_udp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False):
+def allocate_tcp_udp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False, sni_hostname=None):
     """分配TCP连接但UDP中继的TURN地址，支持多IP备选和自动重试
     
     Args:
@@ -1663,6 +1690,7 @@ def allocate_tcp_udp(server_address=None, username=None, password=None, realm=No
         use_tls: 是否使用TLS
         server_hostname: 服务器主机名（用于DNS发现和TLS）
         use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+        sni_hostname: 自定义SNI主机名（用于TLS握手）
     """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
@@ -1686,7 +1714,7 @@ def allocate_tcp_udp(server_address=None, username=None, password=None, realm=No
         current_address = (ip, server_address[1])
         print(f"[+] TCP+UDP Attempt {i}/{len(ips)}: Trying {current_address}")
         
-        result = allocate_tcp_udp_single_server(current_address, username, password, realm, use_tls, server_hostname, use_short_term_credential)
+        result = allocate_tcp_udp_single_server(current_address, username, password, realm, use_tls, server_hostname, use_short_term_credential, sni_hostname)
         if result:
             print(f"[+] Successfully allocated TCP+UDP on {current_address}")
             return result
@@ -1696,7 +1724,7 @@ def allocate_tcp_udp(server_address=None, username=None, password=None, realm=No
     print("[-] All TCP+UDP IP addresses failed")
     return None
 
-def allocate_tcp_udp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False):
+def allocate_tcp_udp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False, sni_hostname=None):
     """向单个服务器分配TCP连接但UDP中继的TURN地址
     
     Args:
@@ -1705,8 +1733,9 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
         password: 密码
         realm: 认证域（长期凭证需要）
         use_tls: 是否使用TLS
-        server_hostname: 服务器主机名（用于TLS）
+        server_hostname: 服务器主机名（用于DNS发现，如果为None则使用server_address[0]）
         use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+        sni_hostname: 自定义SNI主机名（用于TLS握手，如果为None则使用server_hostname或server_address[0]）
     """
     # 使用传入的认证信息或默认值
     auth_username = username or USERNAME
@@ -1726,8 +1755,35 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
             import ssl
             print("[+] Establishing TLS connection...")
             context = ssl.create_default_context()
-            # 使用主机名而不是IP地址进行SSL握手
-            ssl_hostname = server_hostname or server_address[0]
+            # 确定SNI主机名：
+            # - 如果明确指定了sni_hostname，使用它
+            # - 否则使用IP地址（不使用server_hostname，因为那会导致启用证书验证）
+            if sni_hostname:
+                ssl_hostname = sni_hostname
+                print(f"[+] Using custom SNI hostname: {ssl_hostname}")
+            else:
+                ssl_hostname = server_address[0]  # 使用IP地址，不使用server_hostname
+                print(f"[+] No SNI specified, using IP address: {ssl_hostname}")
+            
+            # 证书验证逻辑：
+            # - 如果指定了SNI，默认开启证书验证
+            # - 如果未指定SNI（使用IP地址），默认关闭证书验证
+            if sni_hostname:
+                # 指定了SNI，检查是否是IP地址
+                try:
+                    socket.inet_aton(ssl_hostname)
+                    # SNI是IP地址，禁用证书验证
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    print("[!] SNI hostname is an IP address, SSL certificate verification disabled")
+                except socket.error:
+                    # SNI是域名，启用证书验证（默认行为）
+                    print(f"[+] Using custom SNI '{sni_hostname}', SSL certificate verification enabled")
+            else:
+                # 未指定SNI，使用IP地址，禁用证书验证
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                print("[!] No SNI specified (using IP address), SSL certificate verification disabled")
             control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
             print("[+] TLS connection established")
         
@@ -1907,7 +1963,7 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
                             print(f"[+] Trying alternate server: {alt_addr}")
                             control_sock.close()
                             # 递归尝试备用服务器
-                            return allocate_tcp_udp_single_server(alt_addr, username, password, realm, use_tls, server_hostname, use_short_term_credential)
+                            return allocate_tcp_udp_single_server(alt_addr, username, password, realm, use_tls, server_hostname, use_short_term_credential, sni_hostname=None)
                         else:
                             print("[-] Failed to parse alternate server address")
                     else:
@@ -1929,7 +1985,7 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
         return None
 
 
-def allocate_tcp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False):
+def allocate_tcp(server_address=None, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False, sni_hostname=None):
     """分配TCP TURN中继地址，支持多IP备选和自动重试
     
     Args:
@@ -1940,6 +1996,7 @@ def allocate_tcp(server_address=None, username=None, password=None, realm=None, 
         use_tls: 是否使用TLS
         server_hostname: 服务器主机名（用于DNS发现）
         use_short_term_credential: 是否使用短期凭证机制（默认False，使用长期凭证）
+        sni_hostname: 自定义SNI主机名（用于TLS握手）
     """
     if server_address is None:
         server_address = (DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT)
@@ -1959,7 +2016,7 @@ def allocate_tcp(server_address=None, username=None, password=None, realm=None, 
         current_address = (ip, server_port)
         print(f"[+] TCP Attempt {i+1}/{len(server_ips)}: Trying {current_address}")
         
-        result = allocate_tcp_single_server(current_address, username, password, realm, use_tls, use_short_term_credential)
+        result = allocate_tcp_single_server(current_address, username, password, realm, use_tls, use_short_term_credential, sni_hostname)
         if result:
             print(f"[+] Successfully allocated TCP on {current_address}")
             return result
@@ -2222,7 +2279,28 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
     control_sock.send(req)
     
     # 接收Connect响应
-    data = control_sock.recv(2000)
+    # 设置10秒超时等待Connect响应
+    original_timeout = control_sock.gettimeout()
+    control_sock.settimeout(10)
+    try:
+        data = control_sock.recv(2000)
+    except socket.timeout:
+        print("[-] Timeout waiting for Connect response (10 seconds)")
+        print("[-] TURN server may be unable to connect to peer (firewall blocking or peer unreachable)")
+        control_sock.settimeout(original_timeout)
+        return None
+    except Exception as e:
+        print(f"[-] Error receiving Connect response: {e}")
+        control_sock.settimeout(original_timeout)
+        return None
+    finally:
+        # 恢复原来的超时时间
+        control_sock.settimeout(original_timeout)
+    
+    if not data:
+        print("[-] No data received in Connect response")
+        return None
+    
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] Connect response:", attrs)
     

@@ -299,6 +299,24 @@ class DNSTURNClient:
             self.sock.close()
         print("[+] Disconnected")
 
+def load_domains_from_file(file_path):
+    """从文件读取域名列表"""
+    domains = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # 跳过空行和注释行
+                if line and not line.startswith('#'):
+                    domains.append(line)
+        return domains
+    except FileNotFoundError:
+        print(f"[-] 文件未找到: {file_path}")
+        return []
+    except Exception as e:
+        print(f"[-] 读取文件出错: {e}")
+        return []
+
 def main():
     """主函数：演示通过UDP TURN转发DNS查询"""
     import argparse
@@ -311,57 +329,213 @@ def main():
     parser.add_argument('--username', help='TURN服务器用户名')
     parser.add_argument('--password', help='TURN服务器密码')
     parser.add_argument('--realm', help='TURN服务器认证域')
-    parser.add_argument('--domain', required=True, help='要查询的域名')
+    parser.add_argument('--domain', help='要查询的域名（单域名查询模式）')
+    parser.add_argument('--domains-file', help='包含域名列表的文件路径（批量测试模式，每行一个域名）')
     parser.add_argument('--query-type', type=int, default=1, 
                        help='查询类型: 1=A记录, 28=AAAA记录, 15=MX记录, 2=NS记录 (默认: 1)')
     parser.add_argument('--mode', choices=['udp', 'tcp-udp'], default='udp', 
                        help='TURN模式: udp (UDP TURN), tcp-udp (TCP连接+UDP中继) (默认: udp)')
     parser.add_argument('--tls', action='store_true', help='使用TLS加密连接')
+    parser.add_argument('--no-reconnect', action='store_true', 
+                       help='批量测试时不重新连接（默认每个查询都重新连接）')
     
     args = parser.parse_args()
     
     # 确定使用的模式
     use_tcp_udp = (args.mode == 'tcp-udp')
     
-    if use_tcp_udp:
-        print("=== DNS Client via TCP+UDP TURN ===")
-    else:
-        print("=== DNS Client via UDP TURN ===")
-    print(f"DNS Server: {args.dns_server}:{args.dns_port}")
-    if args.turn_server:
-        print(f"TURN Server: {args.turn_server}:{args.turn_port or DEFAULT_TURN_PORT}")
-    else:
-        print(f"TURN Server: {DEFAULT_TURN_SERVER}:{DEFAULT_TURN_PORT} (default)")
-    print(f"Mode: {args.mode}")
-    if args.tls:
-        print("TLS: Enabled")
-    print(f"Domain: {args.domain}")
-    print(f"Query Type: {args.query_type}")
-    
-    # 创建DNS TURN客户端
-    dns_client = DNSTURNClient(args.dns_server, args.dns_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, use_tcp_udp, args.tls)
-    
-    try:
-        # 建立连接
-        if not dns_client.connect():
-            print("[-] Failed to establish connection")
+    # 检查是单域名查询还是批量测试
+    if args.domains_file:
+        # 批量测试模式
+        domains = load_domains_from_file(args.domains_file)
+        if not domains:
+            print("[-] 没有读取到任何域名，请检查文件路径和内容")
             return
         
-        # 发送DNS查询
-        transaction_id = dns_client.query_dns(args.domain, args.query_type)
-        
-        if transaction_id:
-            print(f"[+] DNS query sent successfully (ID: {transaction_id})")
+        print("="*70)
+        print("🔍 批量测试域名解析")
+        print("="*70)
+        print(f"DNS Server: {args.dns_server}:{args.dns_port}")
+        if args.turn_server:
+            print(f"TURN Server: {args.turn_server}:{args.turn_port or DEFAULT_TURN_PORT}")
         else:
-            print("[-] Failed to send DNS query")
+            print(f"TURN Server: {DEFAULT_TURN_SERVER}:{DEFAULT_TURN_PORT} (default)")
+        print(f"Mode: {'tcp-udp' if use_tcp_udp else 'udp'}")
+        if args.tls:
+            print("TLS: Enabled")
+        print(f"测试域名数量: {len(domains)}")
+        print(f"查询类型: {args.query_type} ({'A记录' if args.query_type == 1 else 'AAAA记录' if args.query_type == 28 else '其他'})")
+        print()
+        
+        # 创建DNS客户端
+        dns_client = DNSTURNClient(
+            args.dns_server, 
+            args.dns_port, 
+            args.turn_server, 
+            args.turn_port, 
+            args.username, 
+            args.password, 
+            args.realm,
+            use_tcp_udp=use_tcp_udp,
+            use_tls=args.tls
+        )
+        
+        try:
+            # 建立连接
+            if not dns_client.connect():
+                print("[-] Failed to establish TURN connection")
+                return
             
-    except KeyboardInterrupt:
-        print("\n[+] Interrupted by user")
-    except Exception as e:
-        print(f"[-] Unexpected error: {e}")
-    finally:
-        # 清理连接
-        dns_client.disconnect()
+            print("[+] TURN connection established")
+            print()
+            
+            # 统计结果
+            resolved_domains = []
+            failed_domains = []
+            
+            # 测试每个域名
+            for i, domain in enumerate(domains, 1):
+                print(f"[{i}/{len(domains)}] 测试: {domain}")
+                
+                # 如果需要为每个查询建立新连接
+                if not args.no_reconnect and i > 1:
+                    try:
+                        # 断开旧连接
+                        dns_client.disconnect()
+                        # 建立新连接
+                        if not dns_client.connect():
+                            print(f"    ❌ 连接失败")
+                            failed_domains.append((domain, "Connection failed"))
+                            continue
+                    except Exception as conn_e:
+                        print(f"    ❌ 重连失败: {conn_e}")
+                        failed_domains.append((domain, f"Reconnect failed: {conn_e}"))
+                        continue
+                
+                # 执行查询
+                try:
+                    result = dns_client.query_dns(domain, query_type=args.query_type)
+                except Exception as query_e:
+                    error_msg = str(query_e)
+                    print(f"    ❌ 错误: {error_msg}")
+                    failed_domains.append((domain, error_msg))
+                    result = None
+                
+                if result:
+                    if isinstance(result, dict) and result.get('answers'):
+                        answers = result['answers']
+                        ip_addresses = []
+                        for answer in answers:
+                            if answer.get('type') == 1:  # A记录
+                                if len(answer.get('data', [])) == 4:
+                                    ip = socket.inet_ntoa(answer['data'])
+                                    ip_addresses.append(ip)
+                            elif answer.get('type') == 28:  # AAAA记录
+                                if len(answer.get('data', [])) == 16:
+                                    ipv6 = socket.inet_ntop(socket.AF_INET6, answer['data'])
+                                    ip_addresses.append(ipv6)
+                        
+                        if ip_addresses:
+                            print(f"    ✅ 解析成功: {', '.join(ip_addresses)}")
+                            resolved_domains.append((domain, ip_addresses))
+                        else:
+                            # 检查是否是 NXDOMAIN (Flags 0x8183)
+                            flags = result.get('flags', 0)
+                            if flags & 0x8003 == 0x8003:  # NXDOMAIN
+                                print(f"    ⚠️  域名不存在 (NXDOMAIN)")
+                                failed_domains.append((domain, "NXDOMAIN"))
+                            else:
+                                print(f"    ⚠️  收到响应但无对应记录")
+                                failed_domains.append((domain, "No matching record"))
+                    else:
+                        # 检查响应标志
+                        flags = result.get('flags', 0) if isinstance(result, dict) else 0
+                        if flags & 0x8003 == 0x8003:  # NXDOMAIN
+                            print(f"    ⚠️  域名不存在 (NXDOMAIN)")
+                            failed_domains.append((domain, "NXDOMAIN"))
+                        else:
+                            print(f"    ⚠️  收到响应但格式异常")
+                            failed_domains.append((domain, "Invalid response"))
+                else:
+                    print(f"    ❌ 查询失败")
+                    failed_domains.append((domain, "Query failed"))
+                
+                # 短暂延迟，避免请求过快
+                time.sleep(0.3)
+            
+            # 打印总结
+            print()
+            print("="*70)
+            print("📊 测试结果总结")
+            print("="*70)
+            print(f"成功解析: {len(resolved_domains)} 个域名")
+            print(f"解析失败: {len(failed_domains)} 个域名")
+            print()
+            
+            if resolved_domains:
+                print("✅ 成功解析的域名:")
+                for domain, ips in resolved_domains:
+                    print(f"  {domain:50} -> {', '.join(ips)}")
+                print()
+            
+            if failed_domains:
+                print("❌ 解析失败的域名:")
+                for domain, reason in failed_domains[:20]:  # 只显示前20个
+                    print(f"  {domain:50} ({reason})")
+                if len(failed_domains) > 20:
+                    print(f"  ... 还有 {len(failed_domains) - 20} 个域名解析失败")
+            
+        except KeyboardInterrupt:
+            print("\n[+] 测试被用户中断")
+        except Exception as e:
+            print(f"[-] 测试出错: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            dns_client.disconnect()
+    elif args.domain:
+        # 单域名查询模式
+        if use_tcp_udp:
+            print("=== DNS Client via TCP+UDP TURN ===")
+        else:
+            print("=== DNS Client via UDP TURN ===")
+        print(f"DNS Server: {args.dns_server}:{args.dns_port}")
+        if args.turn_server:
+            print(f"TURN Server: {args.turn_server}:{args.turn_port or DEFAULT_TURN_PORT}")
+        else:
+            print(f"TURN Server: {DEFAULT_TURN_SERVER}:{DEFAULT_TURN_PORT} (default)")
+        print(f"Mode: {args.mode}")
+        if args.tls:
+            print("TLS: Enabled")
+        print(f"Domain: {args.domain}")
+        print(f"Query Type: {args.query_type}")
+        
+        # 创建DNS TURN客户端
+        dns_client = DNSTURNClient(args.dns_server, args.dns_port, args.turn_server, args.turn_port, args.username, args.password, args.realm, use_tcp_udp, args.tls)
+        
+        try:
+            # 建立连接
+            if not dns_client.connect():
+                print("[-] Failed to establish connection")
+                return
+            
+            # 发送DNS查询
+            result = dns_client.query_dns(args.domain, args.query_type)
+            
+            if result:
+                print(f"[+] DNS query sent successfully")
+            else:
+                print("[-] Failed to send DNS query")
+                
+        except KeyboardInterrupt:
+            print("\n[+] Interrupted by user")
+        except Exception as e:
+            print(f"[-] Unexpected error: {e}")
+        finally:
+            # 清理连接
+            dns_client.disconnect()
+    else:
+        parser.error("必须指定 --domain 或 --domains-file 之一")
 
 def test_multiple_queries():
     """测试多个DNS查询"""

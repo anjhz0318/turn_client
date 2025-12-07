@@ -57,8 +57,15 @@ class DHCPTURNClient:
         use_tcp_udp: bool = False,
         use_tls: bool = False,
         mac_address: Optional[str] = None,
+        broadcast_mode: bool = False,
     ):
-        self.target_ip = target_ip
+        self.broadcast_mode = broadcast_mode
+        # 广播模式使用 255.255.255.255 作为目标 IP
+        if broadcast_mode:
+            self.target_ip = "255.255.255.255"
+            print("[+] Using broadcast mode (255.255.255.255)")
+        else:
+            self.target_ip = target_ip
         self.target_port = target_port
         self.client_port = client_port
         self.turn_server = turn_server
@@ -89,7 +96,8 @@ class DHCPTURNClient:
 
     def connect(self) -> bool:
         """建立 TURN 中继连接。"""
-        print(f"[+] Connecting to DHCP server {self.target_ip}:{self.target_port} via TURN")
+        mode_str = "broadcast" if self.broadcast_mode else "direct"
+        print(f"[+] Connecting to DHCP server {self.target_ip}:{self.target_port} via TURN ({mode_str} mode)")
 
         server_address = resolve_server_address(
             self.turn_server or DEFAULT_TURN_SERVER,
@@ -360,7 +368,7 @@ class DHCPTURNClient:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="DHCP Client via UDP TURN")
-    parser.add_argument("--target-ip", required=True, help="DHCP 服务器 IP 地址")
+    parser.add_argument("--target-ip", help="DHCP 服务器 IP 地址 (直接模式，与 --broadcast 互斥)")
     parser.add_argument("--target-port", type=int, default=67, help="DHCP 服务器端口 (默认: 67)")
     parser.add_argument("--client-port", type=int, default=68, help="客户端期望端口 (仅显示用途)")
     parser.add_argument("--turn-server", help="TURN 服务器地址")
@@ -373,17 +381,27 @@ def main() -> int:
     parser.add_argument("--tls", action="store_true", help="TURN 连接使用 TLS")
     parser.add_argument("--timeout", type=int, default=10, help="等待响应的超时时间 (秒)")
     parser.add_argument("--no-disconnect", action="store_true", help="调试用，执行后保留连接")
+    parser.add_argument("--broadcast", action="store_true", help="使用广播模式发送 DHCP Discover (目标: 255.255.255.255)")
 
     args = parser.parse_args()
     use_tcp_udp = args.mode == "tcp-udp"
+    
+    # 验证参数：必须指定 --broadcast 或 --target-ip 之一
+    if not args.broadcast and not args.target_ip:
+        parser.error("必须指定 --target-ip (直接模式) 或 --broadcast (广播模式)")
+    
+    if args.broadcast and args.target_ip:
+        parser.error("--broadcast 和 --target-ip 不能同时使用")
 
+    target_display = "255.255.255.255 (broadcast)" if args.broadcast else args.target_ip
     print(f"=== DHCP Client via {'TCP+UDP' if use_tcp_udp else 'UDP'} TURN ===")
-    print(f"Target DHCP Server: {args.target_ip}:{args.target_port}")
+    print(f"Mode: {'Broadcast' if args.broadcast else 'Direct'}")
+    print(f"Target DHCP Server: {target_display}:{args.target_port}")
     print(f"TURN Server: {args.turn_server or DEFAULT_TURN_SERVER}:{args.turn_port or DEFAULT_TURN_PORT}")
     print(f"Credential: {args.username or '<default>'}")
 
     client = DHCPTURNClient(
-        target_ip=args.target_ip,
+        target_ip=args.target_ip or "255.255.255.255",  # 如果使用广播模式，这个值会被覆盖
         target_port=args.target_port,
         client_port=args.client_port,
         turn_server=args.turn_server,
@@ -394,6 +412,7 @@ def main() -> int:
         use_tcp_udp=use_tcp_udp,
         use_tls=args.tls,
         mac_address=args.mac,
+        broadcast_mode=args.broadcast,
     )
 
     try:
@@ -423,4 +442,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

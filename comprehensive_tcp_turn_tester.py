@@ -27,7 +27,7 @@ class ComprehensiveTURNTester:
                  password: str, realm: str = None, use_tls: bool = False,
                  output_file: str = "turn_test_results.json", reuse_connection: bool = True,
                  use_short_term_credential: bool = False, ip_file: Optional[str] = None,
-                 port_file: Optional[str] = None):
+                 port_file: Optional[str] = None, sni_hostname: Optional[str] = None):
         self.turn_server = turn_server
         self.turn_port = turn_port
         self.username = username
@@ -39,6 +39,7 @@ class ComprehensiveTURNTester:
         self.use_short_term_credential = use_short_term_credential
         self.ip_file = ip_file
         self.port_file = port_file
+        self.sni_hostname = sni_hostname
         
         # 初始化发现工具
         self.discovery = TURNServerDiscovery()
@@ -71,7 +72,19 @@ class ComprehensiveTURNTester:
         try:
             port_file = self.port_file or 'standard_test_ports.txt'
             with open(port_file, 'r', encoding="utf-8") as f:
-                ports = [int(line.strip()) for line in f if line.strip() and not line.strip().startswith('#')]
+                ports = []
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    # 处理行内注释：去掉 # 及其后面的内容
+                    if '#' in line:
+                        line = line.split('#')[0].strip()
+                    if line:
+                        try:
+                            ports.append(int(line))
+                        except ValueError:
+                            continue
                 print(f"[+] 使用测试端口文件: {port_file}（共 {len(ports)} 条）")
                 return ports
         except FileNotFoundError:
@@ -176,7 +189,8 @@ class ComprehensiveTURNTester:
             test_port = 53
             result = test_tcp_udp_turn(
                 server_address, self.username, self.password, 
-                self.realm, self.turn_server, self.use_tls, test_ip, test_port, False
+                self.realm, self.turn_server, self.use_tls, test_ip, test_port, False,
+                sni_hostname=self.sni_hostname  # 只有明确指定 --sni 时才传递
             )
             capabilities['tcp_udp'] = result
         except Exception as e:
@@ -190,7 +204,8 @@ class ComprehensiveTURNTester:
             test_port = 80
             result = test_tcp_turn(
                 server_address, self.username, self.password, 
-                self.realm, self.turn_server, self.use_tls, test_ip, test_port, False
+                self.realm, self.turn_server, self.use_tls, test_ip, test_port, False,
+                sni_hostname=self.sni_hostname  # 只有明确指定 --sni 时才传递
             )
             capabilities['tcp'] = result
         except Exception as e:
@@ -240,7 +255,8 @@ class ComprehensiveTURNTester:
                 server_address = (server_ip, self.turn_port)
                 allocation_result, is_short_term = allocate_tcp_with_fallback(
                     server_address, self.username, self.password, 
-                    self.realm, self.use_tls
+                    self.realm, self.use_tls,
+                    sni_hostname=self.sni_hostname  # 只有明确指定 --sni 时才传递
                 )
                 
                 if not allocation_result:
@@ -312,7 +328,8 @@ class ComprehensiveTURNTester:
                 # 分配TCP TURN（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
                 allocation_result, is_short_term = allocate_tcp_with_fallback(
                     server_address, self.username, self.password, 
-                    self.realm, self.use_tls
+                    self.realm, self.use_tls,
+                    sni_hostname=self.sni_hostname  # 只有明确指定 --sni 时才传递
                 )
                 
                 if not allocation_result:
@@ -467,7 +484,7 @@ class ComprehensiveTURNTester:
                         print(f"  [{ip}] {target_ip}: {ports_success}/{ports_tested} 端口成功")
         
 def main():
-    parser = argparse.ArgumentParser(description='TURN服务器综合测试脚本')
+    parser = argparse.ArgumentParser(description='TURN服务器TCP转发综合测试脚本')
     parser.add_argument('--turn-server', required=True, help='TURN服务器域名')
     parser.add_argument('--turn-port', type=int, default=3478, help='TURN服务器端口')
     parser.add_argument('--username', required=True, help='TURN用户名')
@@ -482,6 +499,7 @@ def main():
                        help='已弃用：现在自动使用回退机制（先尝试长期凭据，如果400错误则回退为短期凭据）')
     parser.add_argument('--ip-file', help='自定义测试IP列表文件')
     parser.add_argument('--port-file', help='自定义测试端口列表文件')
+    parser.add_argument('--sni', help='自定义SNI主机名（用于TLS握手，如果未指定则使用TURN服务器域名）')
     
     args = parser.parse_args()
     
@@ -505,7 +523,8 @@ def main():
         reuse_connection=reuse_connection,
         use_short_term_credential=False,  # 不再使用此参数，总是使用回退机制
         ip_file=args.ip_file,
-        port_file=args.port_file
+        port_file=args.port_file,
+        sni_hostname=args.sni
     )
     
     try:

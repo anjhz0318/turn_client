@@ -1,0 +1,107 @@
+# 测试域名列表
+# 每行一个域名，以 # 开头的行为注释
+
+# Azure Private Link - SQL Database
+privatelink.database.windows.net
+mydb.privatelink.database.windows.net
+server1.privatelink.database.windows.net
+server2.privatelink.database.windows.net
+
+# Azure Private Link - Storage Accounts
+privatelink.blob.core.windows.net
+mystorage.privatelink.blob.core.windows.net
+privatelink.file.core.windows.net
+mystorage.privatelink.file.core.windows.net
+privatelink.queue.core.windows.net
+mystorage.privatelink.queue.core.windows.net
+privatelink.table.core.windows.net
+mystorage.privatelink.table.core.windows.net
+
+# Azure Private Link - Key Vault
+privatelink.vault.azure.net
+myvault.privatelink.vault.azure.net
+
+# Azure Private Link - Service Bus
+privatelink.servicebus.windows.net
+myservicebus.privatelink.servicebus.windows.net
+
+# Azure Private Link - Container Registry
+privatelink.azurecr.io
+myregistry.privatelink.azurecr.io
+
+# Azure Private Link - App Service
+privatelink.azurewebsites.net
+myapp.privatelink.azurewebsites.net
+
+# Azure Private Link - API Management
+privatelink.azure-api.net
+myapi.privatelink.azure-api.net
+
+# Azure Private Link - Cosmos DB
+privatelink.cassandra.cosmos.azure.com
+mycosmos.privatelink.cassandra.cosmos.azure.com
+privatelink.mongo.cosmos.azure.com
+mycosmos.privatelink.mongo.cosmos.azure.com
+privatelink.sql.cosmos.azure.com
+mycosmos.privatelink.sql.cosmos.azure.com
+privatelink.table.cosmos.azure.com
+mycosmos.privatelink.table.cosmos.azure.com
+privatelink.gremlin.cosmos.azure.com
+mycosmos.privatelink.gremlin.cosmos.azure.com
+
+# Azure Private Link - Database Services
+privatelink.postgres.database.azure.com
+mypostgres.privatelink.postgres.database.azure.com
+privatelink.mysql.database.azure.com
+mymysql.privatelink.mysql.database.azure.com
+privatelink.mariadb.database.azure.com
+mymariadb.privatelink.mariadb.database.azure.com
+
+# Azure Private Link - Redis Cache
+privatelink.redis.cache.windows.net
+myredis.privatelink.redis.cache.windows.net
+
+# Azure Private Link - Azure Search
+privatelink.search.windows.net
+mysearch.privatelink.search.windows.net
+
+# Azure Private Link - HDInsight
+privatelink.azurehdinsight.net
+mycluster.privatelink.azurehdinsight.net
+
+# Azure Private Link - IoT Hub
+privatelink.azure-devices.net
+myiothub.privatelink.azure-devices.net
+
+# Azure Private Link - Event Grid
+privatelink.eventgrid.azure.net
+mytopic.privatelink.eventgrid.azure.net
+
+# Azure Private Link - SignalR
+privatelink.service.signalr.net
+mysignalr.privatelink.service.signalr.net
+
+# Azure Private Link - Static Web Apps
+privatelink.azurestaticapps.net
+myapp.privatelink.azurestaticapps.net
+
+# Azure Private Link - Data Factory
+privatelink.datafactory.azure.net
+myfactory.privatelink.datafactory.azure.net
+
+# Azure Private Link - Machine Learning
+privatelink.api.azureml.ms
+myworkspace.privatelink.api.azureml.ms
+
+# Azure Private Link - Backup
+privatelink.backup.windowsazure.com
+myvault.privatelink.backup.windowsazure.com
+
+# Azure Private Link - Site Recovery
+privatelink.siterecovery.windowsazure.com
+myvault.privatelink.siterecovery.windowsazure.com
+
+# 测试域名
+www.google.com
+
+

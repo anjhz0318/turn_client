@@ -30,7 +30,7 @@ from turn_client import create_permission
 from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
 
 class HTTPTURNClient:
-    def __init__(self, target_host, target_port=80, use_https=False, turn_server=None, turn_port=None, username=None, password=None, realm=None, use_tls=False, verify_ssl=True, ssl_context=None):
+    def __init__(self, target_host, target_port=80, use_https=False, turn_server=None, turn_port=None, username=None, password=None, realm=None, use_tls=False, verify_ssl=True, ssl_context=None, sni_hostname=None):
         self.target_host = target_host
         self.target_port = target_port
         self.use_https = use_https
@@ -42,6 +42,7 @@ class HTTPTURNClient:
         self.use_tls = use_tls
         self.verify_ssl = verify_ssl
         self.ssl_context = ssl_context
+        self.custom_sni = sni_hostname
         
         self.control_sock = None
         self.data_sock = None
@@ -63,7 +64,8 @@ class HTTPTURNClient:
         try:
             # 1. 分配TCP TURN中继地址（使用回退机制：先尝试长期凭据，如果400错误则回退为短期凭据）
             allocation_result, is_short_term = allocate_tcp_with_fallback(
-                server_address, self.username, self.password, self.realm, self.use_tls
+                server_address, self.username, self.password, self.realm, self.use_tls,
+                sni_hostname=self.custom_sni or (self.turn_server if self.use_tls else None)
             )
             if not allocation_result:
                 print("[-] Failed to allocate TCP TURN relay")
@@ -136,13 +138,77 @@ class HTTPTURNClient:
                         context = self.ssl_context
                     
                     # 包装socket为SSL socket
-                    self.data_sock = context.wrap_socket(self.data_sock, server_hostname=self.target_host)
+                    # 对于HTTPS连接，SNI应该使用目标服务器的域名，而不是TURN服务器的域名
+                    # self.custom_sni 是用于TURN服务器连接的SNI，不应该用于目标服务器
+                    sni_hostname = self.target_host
+                    # 检查target_host是否是IP地址（简单检查：包含点号且各部分都是数字）
+                    try:
+                        parts = self.target_host.split('.')
+                        is_ip = len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
+                        if is_ip:
+                            # 对于10.233.0.243，根据之前的证书信息，使用ingress-nginx admission webhook的域名
+                            if self.target_host == '10.233.0.243':
+                                sni_hostname = 'nginx-0-ingress-nginx-controller-admission.ingress-nginx.svc'
+                                print(f"[+] Using certificate SAN domain '{sni_hostname}' as SNI (target is IP: {self.target_host})")
+                            else:
+                                # 其他IP地址，无法确定正确的SNI，使用IP地址（可能导致证书验证失败）
+                                print(f"[!] Target is IP address {self.target_host}, using IP as SNI (certificate verification may fail)")
+                        else:
+                            # target_host是域名，直接使用作为SNI
+                            print(f"[+] Using target hostname '{sni_hostname}' as SNI for HTTPS connection")
+                    except:
+                        pass
+                    self.data_sock = context.wrap_socket(self.data_sock, server_hostname=sni_hostname)
                     
-                    # 获取SSL信息
+                    # 获取SSL信息（即使禁用验证也获取证书信息）
+                    peer_cert = None
+                    try:
+                        # 尝试获取证书（字典格式）
+                        peer_cert = self.data_sock.getpeercert(binary_form=False)
+                        if not peer_cert:
+                            # 如果返回None，尝试获取二进制格式
+                            cert_binary = self.data_sock.getpeercert(binary_form=True)
+                            if cert_binary:
+                                print(f"[+] Got binary certificate ({len(cert_binary)} bytes), parsing...")
+                                # 尝试使用cryptography库解析
+                                try:
+                                    from cryptography import x509
+                                    from cryptography.hazmat.backends import default_backend
+                                    cert_obj = x509.load_der_x509_certificate(cert_binary, default_backend())
+                    
+                                    # 辅助函数：将X509Name转换为字典
+                                    def x509_name_to_dict(name):
+                                        result = []
+                                        for attr in name:
+                                            result.append((attr.oid._name, attr.value))
+                                        return result
+                                    
+                                    # 转换为字典格式
+                                    peer_cert = {
+                                        'subject': dict(x509_name_to_dict(cert_obj.subject)),
+                                        'issuer': dict(x509_name_to_dict(cert_obj.issuer)),
+                                        'notBefore': cert_obj.not_valid_before.strftime('%b %d %H:%M:%S %Y %Z'),
+                                        'notAfter': cert_obj.not_valid_after.strftime('%b %d %H:%M:%S %Y %Z'),
+                                        'serialNumber': str(cert_obj.serial_number),
+                                    }
+                                    # 尝试获取SAN
+                                    try:
+                                        san_ext = cert_obj.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                                        peer_cert['subjectAltName'] = [('DNS', alt.value) for alt in san_ext.value if hasattr(alt, 'value')]
+                                    except:
+                                        pass
+                                except ImportError:
+                                    print("[!] cryptography library not available, showing raw certificate info")
+                                    print(f"[+] Certificate binary length: {len(cert_binary)} bytes")
+                                except Exception as e2:
+                                    print(f"[!] Failed to parse binary certificate: {e2}")
+                    except Exception as e:
+                        print(f"[!] Failed to get peer cert: {e}")
+                    
                     self.ssl_info = {
                         'version': self.data_sock.version(),
                         'cipher': self.data_sock.cipher(),
-                        'peer_cert': self.data_sock.getpeercert() if self.verify_ssl else None,
+                        'peer_cert': peer_cert,
                         'compression': self.data_sock.compression(),
                         'selected_alpn_protocol': getattr(self.data_sock, 'selected_alpn_protocol', lambda: None)(),
                         'selected_npn_protocol': getattr(self.data_sock, 'selected_npn_protocol', lambda: None)()
@@ -157,10 +223,20 @@ class HTTPTURNClient:
                         print(f"[+] ALPN protocol: {self.ssl_info['selected_alpn_protocol']}")
                     if self.ssl_info['peer_cert']:
                         cert = self.ssl_info['peer_cert']
+                        print(f"\n[+] === Certificate Information ===")
                         print(f"[+] Certificate subject: {cert.get('subject', 'Unknown')}")
                         print(f"[+] Certificate issuer: {cert.get('issuer', 'Unknown')}")
+                        if 'notBefore' in cert:
+                            print(f"[+] Certificate valid from: {cert['notBefore']}")
                         if 'notAfter' in cert:
                             print(f"[+] Certificate expires: {cert['notAfter']}")
+                        if 'subjectAltName' in cert:
+                            print(f"[+] Subject Alternative Names: {cert['subjectAltName']}")
+                        if 'serialNumber' in cert:
+                            print(f"[+] Serial number: {cert['serialNumber']}")
+                        print(f"[+] === End Certificate Information ===\n")
+                    else:
+                        print("[!] No certificate information available")
                             
                 except ssl.SSLError as e:
                     print(f"[-] SSL/TLS connection failed: {e}")
@@ -482,7 +558,7 @@ class HTTPTURNClient:
                    target_ip, target_port, use_https=False, verify_ssl=True, 
                    method="GET", path="/", headers=None, body=None, 
                    http_version="1.1", custom_request=None, use_tls=False, 
-                   server_hostname=None, timeout=10):
+                   server_hostname=None, timeout=10, sni_hostname=None):
         """
         静态方法：测试目标服务器的HTTP/HTTPS连接
         
@@ -522,7 +598,8 @@ class HTTPTURNClient:
                 password=turn_password,
                 realm=turn_realm,
                 use_tls=use_tls,
-                verify_ssl=verify_ssl
+                verify_ssl=verify_ssl,
+                sni_hostname=sni_hostname
             )
             
             # 连接
@@ -651,6 +728,7 @@ def main():
     parser.add_argument("--websocket", action="store_true", help="Perform WebSocket handshake instead of standard HTTP request")
     parser.add_argument("--websocket-key", help="Custom Sec-WebSocket-Key value for WebSocket handshake")
     parser.add_argument("--websocket-origin", help="Override Origin header for WebSocket handshake")
+    parser.add_argument("--sni-hostname", help="Custom SNI hostname for HTTPS connection")
     
     args = parser.parse_args()
     
@@ -769,7 +847,8 @@ def main():
         realm=args.realm,
         use_tls=args.tls,
         verify_ssl=not args.no_verify_ssl,
-        ssl_context=ssl_context
+        ssl_context=ssl_context,
+        sni_hostname=args.sni_hostname
     )
     
     try:

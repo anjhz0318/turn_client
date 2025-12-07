@@ -25,9 +25,9 @@ from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT, USERNAME, PASSWORD, R
 from turn_client import (
     allocate_single_server, create_permission, resolve_server_address,
     resolve_peer_address, parse_attrs,
-    STUN_MAGIC_COOKIE, channel_bind, channel_data
+    STUN_MAGIC_COOKIE, channel_bind, channel_data, channel_data_tcp
 )
-from test_turn_capabilities import allocate_with_fallback
+from test_turn_capabilities import allocate_with_fallback, allocate_tcp_udp_with_fallback
 
 # STUN 消息类型（RFC 8656）
 STUN_DATA_INDICATION = 0x0117
@@ -40,7 +40,7 @@ ICMP_DEST_UNREACH = 3
 ICMP_PORT_UNREACH = 3  # ICMP 代码 3 = 端口不可达
 
 
-def send_udp_packet(sock, server_address, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, data=b"", username=None, mi_algorithm=None):
+def send_udp_packet(sock, server_address, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, data=b"", username=None, mi_algorithm=None, use_tcp_udp=False):
     """
     通过 TURN 服务器发送 UDP 数据包（使用 ChannelData）
     
@@ -56,6 +56,7 @@ def send_udp_packet(sock, server_address, nonce, realm, integrity_key, peer_ip, 
         data: 要发送的数据（空包用于端口扫描）
         username: TURN 用户名
         mi_algorithm: 消息完整性算法
+        use_tcp_udp: 是否使用 TCP+UDP 模式（TCP 连接但 UDP 中继）
     
     Returns:
         bool: 是否发送成功
@@ -69,20 +70,28 @@ def send_udp_packet(sock, server_address, nonce, realm, integrity_key, peer_ip, 
     
     # 2. 使用 ChannelData 发送数据
     print(f"[+] Sending UDP packet via channel {channel_number} to {peer_ip}:{peer_port} (size: {len(data)} bytes)")
-    if not channel_data(sock, channel_number, data, server_address):
-        print(f"[-] Failed to send ChannelData")
-        return False
+    if use_tcp_udp:
+        # TCP+UDP 模式：通过 TCP 控制连接发送 ChannelData
+        if not channel_data_tcp(sock, channel_number, data, server_address):
+            print(f"[-] Failed to send ChannelData (TCP+UDP mode)")
+            return False
+    else:
+        # 纯 UDP 模式：通过 UDP socket 发送 ChannelData
+        if not channel_data(sock, channel_number, data, server_address):
+                print(f"[-] Failed to send ChannelData")
+                return False
     
     return True
 
 
-def receive_icmp_error(sock, timeout=3):
+def receive_icmp_error(sock, timeout=3, use_tcp_udp=False):
     """
     接收 ICMP 错误消息（通过 Data indication with ICMP attribute）
     
     Args:
         sock: TURN 控制 socket
         timeout: 超时时间（秒）
+        use_tcp_udp: 是否使用 TCP+UDP 模式（TCP socket 使用 recv，UDP socket 使用 recvfrom）
     
     Returns:
         tuple: (icmp_type, icmp_code, peer_address) 或 (None, None, None)
@@ -90,8 +99,15 @@ def receive_icmp_error(sock, timeout=3):
     sock.settimeout(timeout)
     
     try:
-        data, addr = sock.recvfrom(2048)
-        print(f"[+] Received {len(data)} bytes from {addr}")
+        if use_tcp_udp:
+            # TCP socket 使用 recv
+            data = sock.recv(2048)
+            addr = None  # TCP 不需要地址
+            print(f"[+] Received {len(data)} bytes (TCP mode)")
+        else:
+            # UDP socket 使用 recvfrom
+            data, addr = sock.recvfrom(2048)
+            print(f"[+] Received {len(data)} bytes from {addr}")
         msg_type, tid, attrs = parse_attrs(data)
         print(f"[+] Message type: 0x{msg_type:04x}, Attributes: {list(attrs.keys())}")
         
@@ -139,7 +155,7 @@ def receive_icmp_error(sock, timeout=3):
                     print("[!] Ignoring 401 error (RFC 8656 Section 5: indications are never authenticated)")
                     print("[!] This is likely a server implementation issue, continuing to wait for ICMP...")
                     # 继续等待，不返回
-                    return receive_icmp_error(sock, timeout)  # 递归调用继续等待
+                    return receive_icmp_error(sock, timeout, use_tcp_udp)  # 递归调用继续等待
             else:
                 print(f"[!] Received unexpected message type: 0x{msg_type:04x}")
         
@@ -154,7 +170,7 @@ def receive_icmp_error(sock, timeout=3):
 
 
 def scan_udp_port(turn_server, turn_port, username, password, realm, 
-                  target_ip, target_port, timeout=3):
+                  target_ip, target_port, timeout=3, use_tls=False):
     """
     扫描单个 UDP 端口
     
@@ -175,16 +191,27 @@ def scan_udp_port(turn_server, turn_port, username, password, realm,
     print(f"扫描端口: {target_ip}:{target_port}")
     print(f"{'='*60}")
     
-    # 1. 分配 UDP TURN 中继地址（使用回退机制）
+    # 1. 分配 TURN 中继地址（使用回退机制）
     server_address = resolve_server_address(turn_server, turn_port)
     if not server_address:
         print("[-] Failed to resolve TURN server address")
         return "error"
     
     print(f"[+] Using TURN server: {server_address}")
-    allocation_result, is_short_term = allocate_with_fallback(
-        server_address, username, password, realm, turn_server
-    )
+    
+    # 如果使用 TLS，使用 TCP+UDP TURN 模式（TCP 连接但 UDP 中继）
+    if use_tls:
+        print("[+] Using TCP+UDP TURN mode (TLS requires TCP connection)")
+        allocation_result, is_short_term = allocate_tcp_udp_with_fallback(
+            server_address, username, password, realm, turn_server, use_tls
+        )
+        use_tcp_udp = True
+    else:
+        # 纯 UDP TURN 模式
+        allocation_result, is_short_term = allocate_with_fallback(
+            server_address, username, password, realm, turn_server, use_tls
+        )
+        use_tcp_udp = False
     
     if not allocation_result:
         print("[-] Failed to allocate UDP TURN relay")
@@ -211,7 +238,7 @@ def scan_udp_port(turn_server, turn_port, username, password, realm,
         print(f"[+] Sending empty UDP packet to {target_ip}:{target_port}")
         channel_number = 0x4000  # 使用第一个可用 channel 号
         if not send_udp_packet(sock, actual_server_address, nonce, realm, integrity_key, 
-                               target_ip, target_port, channel_number, b"", username, mi_algorithm):
+                               target_ip, target_port, channel_number, b"", username, mi_algorithm, use_tcp_udp):
             return "error"
         
         # 4. 等待并接收 ICMP 错误消息（多次尝试，因为可能先收到错误响应）
@@ -221,7 +248,7 @@ def scan_udp_port(turn_server, turn_port, username, password, realm,
         # 多次尝试接收，因为可能先收到其他响应
         max_attempts = 3
         for attempt in range(max_attempts):
-            result = receive_icmp_error(sock, timeout // max_attempts + 1)
+            result = receive_icmp_error(sock, timeout // max_attempts + 1, use_tcp_udp)
             if result[0] is not None:  # 收到 ICMP 错误
                 icmp_type, icmp_code, peer_addr = result
                 break
@@ -244,7 +271,7 @@ def scan_udp_port(turn_server, turn_port, username, password, realm,
 
 
 def scan_multiple_ports(turn_server, turn_port, username, password, realm,
-                        target_ip, ports, timeout=3):
+                        target_ip, ports, timeout=3, use_tls=False):
     """
     扫描多个 UDP 端口
     
@@ -272,7 +299,7 @@ def scan_multiple_ports(turn_server, turn_port, username, password, realm,
     
     for port in ports:
         status = scan_udp_port(turn_server, turn_port, username, password, realm,
-                              target_ip, port, timeout)
+                              target_ip, port, timeout, use_tls)
         results[port] = status
         time.sleep(0.5)  # 避免请求过快
     
@@ -295,6 +322,7 @@ def main():
     parser.add_argument("--username", required=True, help="TURN 用户名")
     parser.add_argument("--password", required=True, help="TURN 密码")
     parser.add_argument("--realm", help="TURN realm")
+    parser.add_argument("--tls", action="store_true", help="使用 TLS 加密连接")
     parser.add_argument("--target", required=True, help="目标 IP 地址")
     parser.add_argument("--ports", required=True, help="端口列表（逗号分隔）或端口范围（如 80-100）")
     parser.add_argument("--timeout", type=int, default=3, help="超时时间（秒）")
@@ -318,7 +346,7 @@ def main():
     results = scan_multiple_ports(
         args.turn_server, args.turn_port,
         args.username, args.password, args.realm,
-        args.target, ports, args.timeout
+        args.target, ports, args.timeout, args.tls
     )
     
     # 统计结果

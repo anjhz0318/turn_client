@@ -1,0 +1,47 @@
+# Kubernetes 相关端口列表
+
+# ---- Ingress / Service 常见端口 ----
+80      # HTTP
+443     # HTTPS / Ingress
+8080    # HTTP (备用端口)
+8443    # HTTPS (备用端口 / 一些 API server/控制面组件)
+3000    # Grafana / 通用 Web UI
+9090    # Prometheus
+9100    # node_exporter
+
+# ---- Kubernetes 控制平面 ----
+6443    # kube-apiserver（安全端口，默认）
+8080    # kube-apiserver（非安全端口，较少见）
+2379    # etcd 客户端
+2380    # etcd 集群内部通信
+2381    # etcd metrics
+
+# ---- Kubelet / 节点组件 ----
+4194    # cAdvisor（旧版 kubelet 集成）
+10250   # kubelet HTTPS API
+10255   # kubelet 只读端口（旧版）
+10256   # kube-proxy metrics
+
+# ---- 控制器组件 ----
+10251   # kube-scheduler
+10252   # kube-controller-manager
+
+# ---- 网络 / CNI 组件（示例：Weave / Flannel / Calico / Cilium 等）----
+6782    # Weave peer 通信
+6783    # Weave data 通信
+6784    # Weave metrics / 其他
+
+# Flannel（常见端口）
+8472    # Flannel VXLAN (UDP)
+
+# Calico（常见端口）
+179     # BGP (Calico 对等连接)
+5473    # Typha（集群内可选组件）
+
+# Cilium（常见端口）
+4240    # Cilium agent health / debug（旧版）
+4244    # Cilium operator / metrics（视部署而定）
+
+# ---- 其他常见运维端口 ----
+6666    # 自定义/未知服务（原有端口，保留）
+9099    # 自定义运维/监控服务常用端口
