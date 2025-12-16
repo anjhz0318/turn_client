@@ -142,7 +142,7 @@ def allocate_with_fallback(server_address, username, password, realm, server_hos
     
     return None, None
 
-def allocate_tcp_with_fallback(server_address, username, password, realm, use_tls=False, sni_hostname=None):
+def allocate_tcp_with_fallback(server_address, username, password, realm, use_tls=False, sni_hostname=None, send_sni=True):
     """尝试分配TCP TURN地址，带回退机制：先尝试长期凭据，如果收到400错误则回退为短期凭据
     
     Args:
@@ -158,7 +158,7 @@ def allocate_tcp_with_fallback(server_address, username, password, realm, use_tl
     """
     # 先尝试长期凭据
     print("[+] Trying long-term credential mechanism...")
-    result = allocate_tcp_single_server(server_address, username, password, realm, use_tls, use_short_term_credential=False, sni_hostname=sni_hostname)
+    result = allocate_tcp_single_server(server_address, username, password, realm, use_tls, use_short_term_credential=False, sni_hostname=sni_hostname, send_sni=send_sni)
     
     if result:
         return result, False
@@ -173,20 +173,34 @@ def allocate_tcp_with_fallback(server_address, username, password, realm, use_tl
         if use_tls:
             import ssl
             context = ssl.create_default_context()
-            # 确定SNI主机名
-            if sni_hostname:
+            # 确定SNI主机名和是否发送SNI
+            if not send_sni:
+                ssl_hostname = None
+            elif sni_hostname:
                 ssl_hostname = sni_hostname
             else:
                 ssl_hostname = server_address[0]
-            # 如果SNI主机名是IP地址，禁用证书验证
-            try:
-                socket.inet_aton(ssl_hostname)
+            
+            # 证书验证逻辑（仅在发送SNI时）
+            if send_sni and ssl_hostname:
+                # 如果SNI主机名是IP地址，禁用证书验证
+                try:
+                    socket.inet_aton(ssl_hostname)
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                except socket.error:
+                    # 不是IP地址，保持默认验证
+                    pass
+            else:
+                # 不发送SNI时，禁用证书验证
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
-            except socket.error:
-                # 不是IP地址，保持默认验证
-                pass
-            control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+            
+            # 发送SNI（如果send_sni=True且ssl_hostname不为None）
+            if send_sni and ssl_hostname:
+                control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+            else:
+                control_sock = context.wrap_socket(control_sock, server_hostname=None)
         
         from turn_client import build_msg, stun_attr, gen_tid, STUN_ALLOCATE_REQUEST, parse_attrs, compute_long_term_hmac_key
         from turn_client import STUN_ALLOCATE_ERROR_RESPONSE, STUN_ATTR_ERROR_CODE, STUN_ATTR_USERNAME, STUN_ATTR_REALM, STUN_ATTR_NONCE, STUN_ATTR_REQUESTED_TRANSPORT
@@ -233,7 +247,7 @@ def allocate_tcp_with_fallback(server_address, username, password, realm, use_tl
                                 if error_class2 == 4 and error_number2 == 0:  # 400
                                     print("[+] Received 400 error with long-term credential, falling back to short-term credential...")
                                     control_sock.close()
-                                    result = allocate_tcp_single_server(server_address, username, password, realm, use_tls, use_short_term_credential=True, sni_hostname=sni_hostname)
+                                    result = allocate_tcp_single_server(server_address, username, password, realm, use_tls, use_short_term_credential=True, sni_hostname=sni_hostname, send_sni=send_sni)
                                     if result:
                                         return result, True
                                     else:
@@ -246,13 +260,13 @@ def allocate_tcp_with_fallback(server_address, username, password, realm, use_tl
     
     # 回退为短期凭据
     print("[+] Long-term credential failed, trying short-term credential...")
-    result = allocate_tcp_single_server(server_address, username, password, realm, use_tls, use_short_term_credential=True, sni_hostname=sni_hostname)
+    result = allocate_tcp_single_server(server_address, username, password, realm, use_tls, use_short_term_credential=True, sni_hostname=sni_hostname, send_sni=send_sni)
     if result:
         return result, True
     
     return None, None
 
-def allocate_tcp_udp_with_fallback(server_address, username, password, realm, server_hostname=None, use_tls=False, sni_hostname=None):
+def allocate_tcp_udp_with_fallback(server_address, username, password, realm, server_hostname=None, use_tls=False, sni_hostname=None, send_sni=True):
     """尝试分配TCP+UDP TURN地址，带回退机制：先尝试长期凭据，如果收到400错误则回退为短期凭据
     
     Args:
@@ -263,13 +277,14 @@ def allocate_tcp_udp_with_fallback(server_address, username, password, realm, se
         server_hostname: 服务器主机名
         use_tls: 是否使用TLS
         sni_hostname: 自定义SNI主机名（用于TLS握手）
+        send_sni: 是否发送SNI（默认True）
     
     Returns:
         (result, is_short_term) 或 (None, None)
     """
     # 先尝试长期凭据
     print("[+] Trying long-term credential mechanism...")
-    result = allocate_tcp_udp_single_server(server_address, username, password, realm, use_tls, server_hostname, use_short_term_credential=False, sni_hostname=sni_hostname)
+    result = allocate_tcp_udp_single_server(server_address, username, password, realm, use_tls, server_hostname, use_short_term_credential=False, sni_hostname=sni_hostname, send_sni=send_sni)
     
     if result:
         return result, False
@@ -285,20 +300,33 @@ def allocate_tcp_udp_with_fallback(server_address, username, password, realm, se
             import ssl
             import socket
             context = ssl.create_default_context()
-            # 确定SNI主机名：优先使用自定义SNI，否则使用server_hostname，最后使用IP地址
-            if sni_hostname:
+            # 确定SNI主机名和是否发送SNI
+            if not send_sni:
+                # 不发送SNI模式
+                ssl_hostname = None
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            elif sni_hostname:
                 ssl_hostname = sni_hostname
             else:
                 ssl_hostname = server_hostname or server_address[0]
-            # 如果SNI主机名是 IP 地址，禁用证书验证
-            try:
-                socket.inet_aton(ssl_hostname)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-            except socket.error:
-                # 不是 IP 地址，使用域名进行验证（保持默认验证）
-                pass
-            control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+            
+            # 证书验证逻辑（仅在发送SNI时）
+            if send_sni and ssl_hostname:
+                # 如果SNI主机名是 IP 地址，禁用证书验证
+                try:
+                    socket.inet_aton(ssl_hostname)
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                except socket.error:
+                    # 不是 IP 地址，使用域名进行验证（保持默认验证）
+                    pass
+            
+            # 发送SNI（如果send_sni=True且ssl_hostname不为None）
+            if send_sni and ssl_hostname:
+                control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+            else:
+                control_sock = context.wrap_socket(control_sock, server_hostname=None)
         
         from turn_client import build_msg, stun_attr, gen_tid, STUN_ALLOCATE_REQUEST, parse_attrs, compute_long_term_hmac_key
         from turn_client import STUN_ALLOCATE_ERROR_RESPONSE, STUN_ATTR_ERROR_CODE, STUN_ATTR_USERNAME, STUN_ATTR_REALM, STUN_ATTR_NONCE, STUN_ATTR_REQUESTED_TRANSPORT
@@ -345,7 +373,7 @@ def allocate_tcp_udp_with_fallback(server_address, username, password, realm, se
                                 if error_class2 == 4 and error_number2 == 0:  # 400
                                     print("[+] Received 400 error with long-term credential, falling back to short-term credential...")
                                     control_sock.close()
-                                    result = allocate_tcp_udp_single_server(server_address, username, password, realm, use_tls, server_hostname, use_short_term_credential=True, sni_hostname=sni_hostname)
+                                    result = allocate_tcp_udp_single_server(server_address, username, password, realm, use_tls, server_hostname, use_short_term_credential=True, sni_hostname=sni_hostname, send_sni=send_sni)
                                     if result:
                                         return result, True
                                     else:
@@ -358,7 +386,7 @@ def allocate_tcp_udp_with_fallback(server_address, username, password, realm, se
     
     # 回退为短期凭据
     print("[+] Long-term credential failed, trying short-term credential...")
-    result = allocate_tcp_udp_single_server(server_address, username, password, realm, use_tls, server_hostname, use_short_term_credential=True, sni_hostname=sni_hostname)
+    result = allocate_tcp_udp_single_server(server_address, username, password, realm, use_tls, server_hostname, use_short_term_credential=True, sni_hostname=sni_hostname, send_sni=send_sni)
     if result:
         return result, True
     
@@ -426,7 +454,7 @@ def test_udp_turn(server_address, username, password, realm, server_hostname, ta
         print(f"❌ UDP TURN测试失败: {e}")
         return False
 
-def test_tcp_udp_turn(server_address, username, password, realm, server_hostname, use_tls, target_ip="8.8.8.8", target_port=53, use_short_term_credential=False, sni_hostname=None):
+def test_tcp_udp_turn(server_address, username, password, realm, server_hostname, use_tls, target_ip="8.8.8.8", target_port=53, use_short_term_credential=False, sni_hostname=None, send_sni=True):
     """测试TCP+UDP TURN功能
     
     Args:
@@ -454,7 +482,7 @@ def test_tcp_udp_turn(server_address, username, password, realm, server_hostname
         # 仅验证是否能够成功分配 TCP+UDP TURN 中继
         print("\n[1/1] 分配TCP+UDP TURN中继地址...")
         result, is_short_term = allocate_tcp_udp_with_fallback(
-            server_address, username, password, realm, server_hostname, use_tls, sni_hostname
+            server_address, username, password, realm, server_hostname, use_tls, sni_hostname, send_sni
         )
         if not result:
             print("❌ TCP+UDP TURN分配失败")
@@ -475,7 +503,7 @@ def test_tcp_udp_turn(server_address, username, password, realm, server_hostname
         print(f"❌ TCP+UDP TURN测试失败: {e}")
         return False
 
-def test_tcp_turn(server_address, username, password, realm, server_hostname, use_tls, target_ip="httpbin.org", target_port=80, use_short_term_credential=False, sni_hostname=None):
+def test_tcp_turn(server_address, username, password, realm, server_hostname, use_tls, target_ip="httpbin.org", target_port=80, use_short_term_credential=False, sni_hostname=None, send_sni=True):
     """测试TCP TURN功能
     
     Args:
@@ -502,7 +530,7 @@ def test_tcp_turn(server_address, username, password, realm, server_hostname, us
         
         # 1. 分配TCP TURN中继地址（带回退机制）
         print("\n[1/1] 分配TCP TURN中继地址...")
-        result, is_short_term = allocate_tcp_with_fallback(server_address, username, password, realm, use_tls, sni_hostname)
+        result, is_short_term = allocate_tcp_with_fallback(server_address, username, password, realm, use_tls, sni_hostname, send_sni)
         if not result:
             print("❌ TCP TURN分配失败")
             return False

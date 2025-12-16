@@ -21,6 +21,7 @@ import threading
 import time
 import queue
 import csv
+import tempfile
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 import sys
@@ -53,27 +54,64 @@ class TURNIPScanner:
         self.found_count = 0
         
     def _load_results(self) -> Dict:
-        """加载已有结果"""
+        """加载已有结果（从JSON文件读取字典，key是IP地址）"""
         if os.path.exists(self.output_file):
             try:
                 with open(self.output_file, 'r') as f:
-                    return json.load(f)
+                    results = json.load(f)
+                    # 确保返回的是字典格式（key是IP地址）
+                    if isinstance(results, dict):
+                        return results
+                    else:
+                        print(f"[-] 结果文件格式错误，期望字典格式", flush=True)
+                        return {}
             except Exception as e:
                 print(f"[-] 无法加载结果文件: {e}", flush=True)
         return {}
     
     def _save_results(self):
-        """保存结果到文件"""
+        """保存结果到文件（增量更新模式，原子操作）"""
         try:
+            # 先读取现有文件（如果存在），然后update，再保存
+            existing_results = {}
+            if os.path.exists(self.output_file):
+                try:
+                    with open(self.output_file, 'r') as f:
+                        existing_results = json.load(f)
+                except:
+                    # 如果读取失败，使用空字典
+                    existing_results = {}
+            
+            # 将当前结果update到现有结果中
+            existing_results.update(self.results)
+            
             # 确保所有数据都是JSON可序列化的
-            serializable_results = make_json_serializable(self.results)
-            with open(self.output_file, 'w') as f:
-                json.dump(serializable_results, f, indent=2)
+            serializable_results = make_json_serializable(existing_results)
+            
+            # 原子写入：先写入临时文件，然后原子性地重命名
+            temp_file = self.output_file + '.tmp'
+            try:
+                # 写入临时文件
+                with open(temp_file, 'w') as f:
+                    json.dump(serializable_results, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # 确保数据写入磁盘
+                
+                # 原子性地替换原文件（在POSIX系统上，rename是原子操作）
+                os.replace(temp_file, self.output_file)
+            except Exception as e:
+                # 如果写入失败，删除临时文件
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                raise e
         except Exception as e:
             print(f"[-] 保存结果失败: {e}", flush=True)
     
     def _update_last_scanned_ip(self, ip: str):
-        """更新最后扫描的IP地址（线程安全）"""
+        """更新最后扫描的IP地址（线程安全，增量更新模式，原子操作）"""
         try:
             with self.lock:
                 # 在结果文件中添加元数据字段（使用特殊前缀避免与IP地址冲突）
@@ -81,9 +119,41 @@ class TURNIPScanner:
                     self.results['_metadata'] = {}
                 self.results['_metadata']['last_scanned_ip'] = ip
                 self.results['_metadata']['last_scan_timestamp'] = datetime.now().isoformat()
-                # 立即保存（不等待完整结果保存）
-                with open(self.output_file, 'w') as f:
-                    json.dump(self.results, f, indent=2)
+                
+                # 先读取现有文件，然后update，再保存
+                existing_results = {}
+                if os.path.exists(self.output_file):
+                    try:
+                        with open(self.output_file, 'r') as f:
+                            existing_results = json.load(f)
+                    except:
+                        existing_results = {}
+                
+                # 将当前结果update到现有结果中
+                existing_results.update(self.results)
+                
+                # 确保所有数据都是JSON可序列化的
+                serializable_results = make_json_serializable(existing_results)
+                
+                # 原子写入：先写入临时文件，然后原子性地重命名
+                temp_file = self.output_file + '.tmp'
+                try:
+                    # 写入临时文件
+                    with open(temp_file, 'w') as f:
+                        json.dump(serializable_results, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())  # 确保数据写入磁盘
+                    
+                    # 原子性地替换原文件
+                    os.replace(temp_file, self.output_file)
+                except Exception as e:
+                    # 如果写入失败，删除临时文件
+                    if os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except:
+                            pass
+                    raise e
         except Exception as e:
             print(f"[!] 更新最后扫描IP失败: {e}", flush=True)
     
@@ -884,27 +954,55 @@ class TURNIPScanner:
         print(f"[+] 从CSV文件读取IP列表: {csv_file}", flush=True)
         
         # 读取CSV文件，提取IP列（第二列，索引1）
+        # 使用列表保持顺序，同时用set来去重检查
         ip_list = []
+        ip_seen = set()
+        total_rows = 0
         try:
             with open(csv_file, 'r', encoding='utf-8') as f:
                 reader = csv.reader(f)
                 next(reader)  # 跳过表头
                 for row in reader:
+                    total_rows += 1
                     if len(row) > 1:
                         ip = row[1].strip()  # IP列是第二列（索引1）
-                        if ip and ip not in ip_list:  # 去重
+                        if ip and ip not in ip_seen:  # 去重但保持顺序
                             ip_list.append(ip)
+                            ip_seen.add(ip)
+                    # 每读取10万行输出一次进度
+                    if total_rows % 100000 == 0:
+                        print(f"[*] 已读取 {total_rows:,} 行，提取到 {len(ip_list):,} 个唯一IP...", flush=True)
         except Exception as e:
             print(f"[-] 读取CSV文件失败: {e}", flush=True)
             return
         
         total_ips = len(ip_list)
-        print(f"[+] 从CSV文件读取到 {total_ips} 个唯一IP地址", flush=True)
+        print(f"[+] 从CSV文件读取完成: 共 {total_rows:,} 行，提取到 {total_ips:,} 个唯一IP地址", flush=True)
+        
+        # 获取最后扫描的IP地址，并在列表中查找
+        last_scanned_ip = self._get_last_scanned_ip()
+        start_index = 0
+        if last_scanned_ip:
+            try:
+                start_index = ip_list.index(last_scanned_ip) + 1
+                print(f"[+] 从上次中断处继续: {last_scanned_ip} (索引 {ip_list.index(last_scanned_ip)}) -> 从索引 {start_index} 开始", flush=True)
+            except ValueError:
+                # last_scanned_ip不在列表中，从头开始
+                print(f"[!] 警告: last_scanned_ip ({last_scanned_ip}) 不在CSV列表中，从头开始扫描", flush=True)
+                start_index = 0
+        
+        # 只处理start_index之后的IP
+        ip_list_to_scan = ip_list[start_index:]
+        skipped_count = start_index
+        remaining_count = len(ip_list_to_scan)
+        
+        print(f"[+] 跳过已扫描的 {skipped_count} 个IP地址", flush=True)
+        print(f"[+] 剩余 {remaining_count} 个IP地址待扫描", flush=True)
         print(f"[+] 使用 {self.threads} 个线程", flush=True)
         
         # 创建任务队列
         task_queue = queue.Queue()
-        for ip in ip_list:
+        for ip in ip_list_to_scan:
             task_queue.put(ip)
         
         # 工作线程
@@ -938,8 +1036,8 @@ class TURNIPScanner:
                     
                     # 每扫描100个IP打印一次进度
                     if self.scan_count % 100 == 0:
-                        remaining = total_ips - self.scan_count
-                        print(f"[*] 进度: {self.scan_count}/{total_ips} ({100*self.scan_count/total_ips:.2f}%), 已发现: {self.found_count}, 剩余: {remaining}", flush=True)
+                        remaining = remaining_count - self.scan_count
+                        print(f"[*] 进度: {self.scan_count}/{remaining_count} ({100*self.scan_count/remaining_count:.2f}%), 已发现: {self.found_count}, 剩余: {remaining}", flush=True)
                     
                     task_queue.task_done()
                 except queue.Empty:

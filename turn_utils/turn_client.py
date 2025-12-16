@@ -1451,7 +1451,7 @@ def allocate(server_address=None, username=None, password=None, realm=None, serv
     return None
 
 
-def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, use_short_term_credential=False, sni_hostname=None):
+def allocate_tcp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, use_short_term_credential=False, sni_hostname=None, send_sni=True):
     """向单个服务器分配TCP TURN中继地址（使用TCP传输）
     
     Args:
@@ -1482,35 +1482,105 @@ def allocate_tcp_single_server(server_address, username=None, password=None, rea
             print("[+] Establishing TLS connection...")
             context = ssl.create_default_context()
             
-            # 确定SNI主机名
-            if sni_hostname:
+            # 确定SNI主机名和是否发送SNI
+            if not send_sni:
+                # 不发送SNI模式
+                ssl_hostname = None
+                print("[+] SNI disabled: not sending SNI in TLS handshake")
+                # 不发送SNI时，禁用证书验证（因为无法验证主机名）
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            elif sni_hostname:
                 ssl_hostname = sni_hostname
                 print(f"[+] Using custom SNI hostname: {ssl_hostname}")
             else:
                 ssl_hostname = server_address[0]
             
-            # 证书验证逻辑：
-            # - 如果指定了SNI，默认开启证书验证
-            # - 如果未指定SNI（使用IP），默认关闭证书验证
-            if sni_hostname:
-                # 指定了SNI，检查是否是IP地址
-                try:
-                    socket.inet_aton(ssl_hostname)
-                    # SNI是IP地址，禁用证书验证
+            # 证书验证逻辑（仅在发送SNI时）
+            if send_sni:
+                if sni_hostname:
+                    # 指定了SNI，检查是否是IP地址
+                    try:
+                        socket.inet_aton(ssl_hostname)
+                        # SNI是IP地址，禁用证书验证
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        print("[!] SNI hostname is an IP address, SSL certificate verification disabled")
+                    except socket.error:
+                        # SNI是域名，启用证书验证（默认行为）
+                        print(f"[+] Using custom SNI '{sni_hostname}', SSL certificate verification enabled")
+                else:
+                    # 未指定SNI，使用IP地址，禁用证书验证
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
-                    print("[!] SNI hostname is an IP address, SSL certificate verification disabled")
-                except socket.error:
-                    # SNI是域名，启用证书验证（默认行为）
-                    print(f"[+] Using custom SNI '{sni_hostname}', SSL certificate verification enabled")
-            else:
-                # 未指定SNI，使用IP地址，禁用证书验证
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                print("[!] No SNI specified (using IP address), SSL certificate verification disabled")
+                    print("[!] No SNI specified (using IP address), SSL certificate verification disabled")
             
-            control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+            # 发送SNI（如果send_sni=True且ssl_hostname不为None）
+            if send_sni and ssl_hostname:
+                control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+            else:
+                control_sock = context.wrap_socket(control_sock, server_hostname=None)
             print("[+] TLS connection established")
+            
+            # 打印TLS证书信息
+            try:
+                # 先尝试获取字典格式的证书（如果证书验证启用）
+                cert = control_sock.getpeercert()
+                
+                # 如果字典格式不可用，尝试获取二进制格式并解析
+                if not cert:
+                    try:
+                        cert_binary = control_sock.getpeercert(binary_form=True)
+                        if cert_binary:
+                            # 使用cryptography库解析二进制证书
+                            try:
+                                from cryptography import x509
+                                from cryptography.hazmat.backends import default_backend
+                                cert_obj = x509.load_der_x509_certificate(cert_binary, default_backend())
+                                
+                                print("[+] TLS Certificate Information (from binary):")
+                                print(f"    Subject: {cert_obj.subject.rfc4514_string()}")
+                                print(f"    Issuer: {cert_obj.issuer.rfc4514_string()}")
+                                print(f"    Serial Number: {cert_obj.serial_number}")
+                                print(f"    Not Before: {cert_obj.not_valid_before}")
+                                print(f"    Not After: {cert_obj.not_valid_after}")
+                                
+                                # 获取SAN
+                                try:
+                                    san_ext = cert_obj.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                                    san_list = [str(name.value) for name in san_ext.value]
+                                    if san_list:
+                                        print(f"    Subject Alternative Names: {san_list}")
+                                except:
+                                    pass
+                                
+                                print(f"    Certificate (binary): {len(cert_binary)} bytes")
+                            except ImportError:
+                                print(f"[+] Certificate (binary): {len(cert_binary)} bytes (install 'cryptography' for detailed info)")
+                            except Exception as e:
+                                print(f"[!] Failed to parse binary certificate: {e}")
+                        else:
+                            print("[!] No certificate information available")
+                    except Exception as e:
+                        print(f"[!] Failed to get binary certificate: {e}")
+                else:
+                    # 字典格式可用，直接打印
+                    print("[+] TLS Certificate Information:")
+                    print(f"    Subject: {dict(x[0] for x in cert.get('subject', []))}")
+                    print(f"    Issuer: {dict(x[0] for x in cert.get('issuer', []))}")
+                    print(f"    Version: {cert.get('version', 'N/A')}")
+                    print(f"    Serial Number: {cert.get('serialNumber', 'N/A')}")
+                    print(f"    Not Before: {cert.get('notBefore', 'N/A')}")
+                    print(f"    Not After: {cert.get('notAfter', 'N/A')}")
+                    
+                    # 打印Subject Alternative Names (SAN)
+                    san_list = []
+                    for ext in cert.get('subjectAltName', []):
+                        san_list.append(ext)
+                    if san_list:
+                        print(f"    Subject Alternative Names: {san_list}")
+            except Exception as e:
+                print(f"[!] Failed to get certificate information: {e}")
         
         if use_short_term_credential:
             # 短期凭证：直接发送带认证的请求，不需要nonce/realm
@@ -1724,7 +1794,7 @@ def allocate_tcp_udp(server_address=None, username=None, password=None, realm=No
     print("[-] All TCP+UDP IP addresses failed")
     return None
 
-def allocate_tcp_udp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False, sni_hostname=None):
+def allocate_tcp_udp_single_server(server_address, username=None, password=None, realm=None, use_tls=False, server_hostname=None, use_short_term_credential=False, sni_hostname=None, send_sni=True):
     """向单个服务器分配TCP连接但UDP中继的TURN地址
     
     Args:
@@ -1755,37 +1825,106 @@ def allocate_tcp_udp_single_server(server_address, username=None, password=None,
             import ssl
             print("[+] Establishing TLS connection...")
             context = ssl.create_default_context()
-            # 确定SNI主机名：
-            # - 如果明确指定了sni_hostname，使用它
-            # - 否则使用IP地址（不使用server_hostname，因为那会导致启用证书验证）
-            if sni_hostname:
+            # 确定SNI主机名和是否发送SNI
+            if not send_sni:
+                # 不发送SNI模式
+                ssl_hostname = None
+                print("[+] SNI disabled: not sending SNI in TLS handshake")
+                # 不发送SNI时，禁用证书验证（因为无法验证主机名）
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            elif sni_hostname:
                 ssl_hostname = sni_hostname
                 print(f"[+] Using custom SNI hostname: {ssl_hostname}")
             else:
                 ssl_hostname = server_address[0]  # 使用IP地址，不使用server_hostname
                 print(f"[+] No SNI specified, using IP address: {ssl_hostname}")
             
-            # 证书验证逻辑：
-            # - 如果指定了SNI，默认开启证书验证
-            # - 如果未指定SNI（使用IP地址），默认关闭证书验证
-            if sni_hostname:
-                # 指定了SNI，检查是否是IP地址
-                try:
-                    socket.inet_aton(ssl_hostname)
-                    # SNI是IP地址，禁用证书验证
+            # 证书验证逻辑（仅在发送SNI时）
+            if send_sni:
+                if sni_hostname:
+                    # 指定了SNI，检查是否是IP地址
+                    try:
+                        socket.inet_aton(ssl_hostname)
+                        # SNI是IP地址，禁用证书验证
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        print("[!] SNI hostname is an IP address, SSL certificate verification disabled")
+                    except socket.error:
+                        # SNI是域名，启用证书验证（默认行为）
+                        print(f"[+] Using custom SNI '{sni_hostname}', SSL certificate verification enabled")
+                else:
+                    # 未指定SNI，使用IP地址，禁用证书验证
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
-                    print("[!] SNI hostname is an IP address, SSL certificate verification disabled")
-                except socket.error:
-                    # SNI是域名，启用证书验证（默认行为）
-                    print(f"[+] Using custom SNI '{sni_hostname}', SSL certificate verification enabled")
+                    print("[!] No SNI specified (using IP address), SSL certificate verification disabled")
+            
+            # 发送SNI（如果send_sni=True且ssl_hostname不为None）
+            if send_sni and ssl_hostname:
+                control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
             else:
-                # 未指定SNI，使用IP地址，禁用证书验证
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                print("[!] No SNI specified (using IP address), SSL certificate verification disabled")
-            control_sock = context.wrap_socket(control_sock, server_hostname=ssl_hostname)
+                control_sock = context.wrap_socket(control_sock, server_hostname=None)
             print("[+] TLS connection established")
+            
+            # 打印TLS证书信息
+            try:
+                # 先尝试获取字典格式的证书（如果证书验证启用）
+                cert = control_sock.getpeercert()
+                
+                # 如果字典格式不可用，尝试获取二进制格式并解析
+                if not cert:
+                    try:
+                        cert_binary = control_sock.getpeercert(binary_form=True)
+                        if cert_binary:
+                            # 使用cryptography库解析二进制证书
+                            try:
+                                from cryptography import x509
+                                from cryptography.hazmat.backends import default_backend
+                                cert_obj = x509.load_der_x509_certificate(cert_binary, default_backend())
+                                
+                                print("[+] TLS Certificate Information (from binary):")
+                                print(f"    Subject: {cert_obj.subject.rfc4514_string()}")
+                                print(f"    Issuer: {cert_obj.issuer.rfc4514_string()}")
+                                print(f"    Serial Number: {cert_obj.serial_number}")
+                                print(f"    Not Before: {cert_obj.not_valid_before}")
+                                print(f"    Not After: {cert_obj.not_valid_after}")
+                                
+                                # 获取SAN
+                                try:
+                                    san_ext = cert_obj.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                                    san_list = [str(name.value) for name in san_ext.value]
+                                    if san_list:
+                                        print(f"    Subject Alternative Names: {san_list}")
+                                except:
+                                    pass
+                                
+                                print(f"    Certificate (binary): {len(cert_binary)} bytes")
+                            except ImportError:
+                                print(f"[+] Certificate (binary): {len(cert_binary)} bytes (install 'cryptography' for detailed info)")
+                            except Exception as e:
+                                print(f"[!] Failed to parse binary certificate: {e}")
+                        else:
+                            print("[!] No certificate information available")
+                    except Exception as e:
+                        print(f"[!] Failed to get binary certificate: {e}")
+                else:
+                    # 字典格式可用，直接打印
+                    print("[+] TLS Certificate Information:")
+                    print(f"    Subject: {dict(x[0] for x in cert.get('subject', []))}")
+                    print(f"    Issuer: {dict(x[0] for x in cert.get('issuer', []))}")
+                    print(f"    Version: {cert.get('version', 'N/A')}")
+                    print(f"    Serial Number: {cert.get('serialNumber', 'N/A')}")
+                    print(f"    Not Before: {cert.get('notBefore', 'N/A')}")
+                    print(f"    Not After: {cert.get('notAfter', 'N/A')}")
+                    
+                    # 打印Subject Alternative Names (SAN)
+                    san_list = []
+                    for ext in cert.get('subjectAltName', []):
+                        san_list.append(ext)
+                    if san_list:
+                        print(f"    Subject Alternative Names: {san_list}")
+            except Exception as e:
+                print(f"[!] Failed to get certificate information: {e}")
         
         if use_short_term_credential:
             # 短期凭证：直接发送带认证的请求，不需要nonce/realm
@@ -2288,18 +2427,18 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
         print("[-] Timeout waiting for Connect response (10 seconds)")
         print("[-] TURN server may be unable to connect to peer (firewall blocking or peer unreachable)")
         control_sock.settimeout(original_timeout)
-        return None
+        return None, {'type': 'timeout', 'message': 'Timeout waiting for Connect response'}
     except Exception as e:
         print(f"[-] Error receiving Connect response: {e}")
         control_sock.settimeout(original_timeout)
-        return None
+        return None, {'type': 'exception', 'message': str(e)}
     finally:
         # 恢复原来的超时时间
         control_sock.settimeout(original_timeout)
     
     if not data:
         print("[-] No data received in Connect response")
-        return None
+        return None, {'type': 'no_data', 'message': 'No data received in Connect response'}
     
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] Connect response:", attrs)
@@ -2311,29 +2450,38 @@ def tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, peer_port, u
         if connection_id:
             conn_id = struct.unpack("!I", connection_id)[0]
             print(f"[+] Got connection ID: {conn_id}")
-            return conn_id
+            return conn_id, None
         else:
             print("[-] No connection ID in Connect response")
             print("[-] Response attributes keys:", list(attrs.keys()))
-            return None
+            return None, {'type': 'no_connection_id', 'message': 'No connection ID in Connect response'}
     elif msg_type == 0x011a:  # Connect Error Response (0x011a)
         print("[-] Connect error")
         error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+        error_info = {'type': 'error_response', 'message': 'Connect error response'}
         if error_code:
             if len(error_code) >= 4:
                 error_class = error_code[2]
                 error_number = error_code[3]
                 error_text = error_code[4:].decode('utf-8', errors='ignore')
-                print(f"[-] Error: {error_class}{error_number:02d} {error_text}")
+                error_code_str = f"{error_class}{error_number:02d}"
+                print(f"[-] Error: {error_code_str} {error_text}")
+                error_info['error_code'] = error_code_str
+                error_info['error_text'] = error_text
+                # 特别标记 447 错误
+                if error_class == 4 and error_number == 47:
+                    error_info['type'] = 'error_447'
+                    error_info['message'] = f'TURN service 447 Error: {error_text}'
             else:
                 error_text = error_code.decode('utf-8', errors='ignore')
                 print(f"[-] Error: {error_text}")
+                error_info['error_text'] = error_text
         print("[-] Response attributes keys:", list(attrs.keys()))
-        return None
+        return None, error_info
     else:
         print(f"[-] Unexpected response type: 0x{msg_type:04x}")
         print("[-] Response attributes keys:", list(attrs.keys()))
-        return None
+        return None, {'type': 'unexpected_response', 'message': f'Unexpected response type: 0x{msg_type:04x}'}
 
 def tcp_connection_bind(control_sock, nonce, realm, integrity_key, connection_id, server_address=None, username=None, mi_algorithm=None):
     """绑定客户端数据连接到对等方连接 (RFC 6062 ConnectionBind请求)
@@ -2534,9 +2682,12 @@ def main_tcp(target_ip, target_port, turn_server=None, turn_port=None, username=
     print("[+] TCP TURN allocation successful")
     
     # 3. 发起TCP连接到对等方
-    connection_id = tcp_connect(control_sock, nonce, realm, integrity_key, target_ip, target_port, username)
+    connection_id, error_info = tcp_connect(control_sock, nonce, realm, integrity_key, target_ip, target_port, username)
     if not connection_id:
-        print("[-] Failed to initiate TCP connection")
+        if error_info:
+            print(f"[-] Failed to initiate TCP connection: {error_info.get('message', 'Unknown error')}")
+        else:
+            print("[-] Failed to initiate TCP connection")
         control_sock.close()
         return
     

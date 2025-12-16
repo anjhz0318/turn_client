@@ -65,7 +65,7 @@ class DHCPTURNClient:
             self.target_ip = "255.255.255.255"
             print("[+] Using broadcast mode (255.255.255.255)")
         else:
-            self.target_ip = target_ip
+        self.target_ip = target_ip
         self.target_port = target_port
         self.client_port = client_port
         self.turn_server = turn_server
@@ -385,7 +385,7 @@ def main() -> int:
 
     args = parser.parse_args()
     use_tcp_udp = args.mode == "tcp-udp"
-    
+
     # 验证参数：必须指定 --broadcast 或 --target-ip 之一
     if not args.broadcast and not args.target_ip:
         parser.error("必须指定 --target-ip (直接模式) 或 --broadcast (广播模式)")

@@ -159,7 +159,7 @@ class RPCBindTURNClient:
 
             # 4. 发起TCP连接
             print(f"[+] Initiating TCP connection to {self.target_host}:{self.target_port}")
-            connection_id = tcp_connect(
+            connection_id, error_info = tcp_connect(
                 self.control_sock,
                 self._nonce,
                 self._realm,
@@ -169,7 +169,10 @@ class RPCBindTURNClient:
                 self.username,
             )
             if not connection_id:
-                print("[-] Failed to initiate TCP connection")
+                if error_info:
+                    print(f"[-] Failed to initiate TCP connection: {error_info.get('message', 'Unknown error')}")
+                else:
+                    print("[-] Failed to initiate TCP connection")
                 self.control_sock.close()
                 return False
 

@@ -108,13 +108,17 @@ class TURNScanner:
                 return False
             
             # 发起TCP连接
-            connection_id = tcp_connect(
+            connection_id, error_info = tcp_connect(
                 self.control_sock, self.nonce, self.realm, self.integrity_key,
                 target_ip, target_port, self.username, self.mi_algorithm
             )
             
             if not connection_id:
-                print(f"❌ TCP连接失败: {target_ip}:{target_port}")
+                if error_info:
+                    error_msg = error_info.get('message', 'Unknown error')
+                    print(f"❌ TCP连接失败: {target_ip}:{target_port} - {error_msg}")
+                else:
+                    print(f"❌ TCP连接失败: {target_ip}:{target_port}")
                 return False
             
             # 建立数据连接

@@ -526,7 +526,6 @@ def main():
                 print(f"[+] DNS query sent successfully")
             else:
                 print("[-] Failed to send DNS query")
-                
         except KeyboardInterrupt:
             print("\n[+] Interrupted by user")
         except Exception as e:

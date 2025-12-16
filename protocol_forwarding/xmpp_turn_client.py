@@ -165,7 +165,7 @@ class XMPPTURNClient:
 
             print("[+] Permission created")
 
-            connection_id = tcp_connect(
+            connection_id, error_info = tcp_connect(
                 self.control_sock,
                 nonce,
                 realm,
@@ -175,7 +175,10 @@ class XMPPTURNClient:
                 self.username,
             )
             if not connection_id:
-                print("[-] Failed to initiate TCP connection to peer")
+                if error_info:
+                    print(f"[-] Failed to initiate TCP connection to peer: {error_info.get('message', 'Unknown error')}")
+                else:
+                    print("[-] Failed to initiate TCP connection to peer")
                 self.control_sock.close()
                 return False
 

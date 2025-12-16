@@ -118,7 +118,7 @@ class SSHTURNClient:
             return False
 
         print(f"[+] Initiating TCP connection to {self.target_host}:{self.target_port}")
-        connection_id = tcp_connect(
+        connection_id, error_info = tcp_connect(
             self.control_sock,
             self.nonce,
             self.realm_value,
@@ -129,7 +129,10 @@ class SSHTURNClient:
             self.mi_algorithm,
         )
         if not connection_id:
-            print("[-] Failed to initiate TCP connection")
+            if error_info:
+                print(f"[-] Failed to initiate TCP connection: {error_info.get('message', 'Unknown error')}")
+            else:
+                print("[-] Failed to initiate TCP connection")
             self.control_sock.close()
             return False
 

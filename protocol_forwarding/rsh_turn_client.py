@@ -136,7 +136,7 @@ class RSHTURNClient:
             return False
 
         print(f"[+] 发起 TCP 连接 -> {peer_ip}:{self.target_port}")
-        connection_id = tcp_connect(
+        connection_id, error_info = tcp_connect(
             self.control_sock,
             self.nonce,
             self.realm_value,
@@ -147,7 +147,10 @@ class RSHTURNClient:
             self.mi_algorithm,
         )
         if not connection_id:
-            print("[-] Connect 请求失败")
+            if error_info:
+                print(f"[-] Connect 请求失败: {error_info.get('message', 'Unknown error')}")
+            else:
+                print("[-] Connect 请求失败")
             self._cleanup()
             return False
 

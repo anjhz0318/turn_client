@@ -71,9 +71,12 @@ class FTPTURNClient:
             print(f"[+] Initiating TCP connection to {self.ftp_host}:{self.ftp_port}")
             print(f"[+] Resolved peer {self.ftp_host} to {peer_ip}")
             
-            connection_id = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.ftp_port, self.turn_username)
+            connection_id, error_info = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.ftp_port, self.turn_username)
             if not connection_id:
-                print("[-] Failed to initiate TCP connection")
+                if error_info:
+                    print(f"[-] Failed to initiate TCP connection: {error_info.get('message', 'Unknown error')}")
+                else:
+                    print("[-] Failed to initiate TCP connection")
                 self.control_sock.close()
                 return False
                 
@@ -311,9 +314,12 @@ class FTPTURNClient:
                 control_sock.close()
                 return None
                 
-            connection_id = tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, data_port, self.turn_username)
+            connection_id, error_info = tcp_connect(control_sock, nonce, realm, integrity_key, peer_ip, data_port, self.turn_username)
             if not connection_id:
-                print("[-] Failed to initiate data TCP connection")
+                if error_info:
+                    print(f"[-] Failed to initiate data TCP connection: {error_info.get('message', 'Unknown error')}")
+                else:
+                    print("[-] Failed to initiate data TCP connection")
                 control_sock.close()
                 return None
                 

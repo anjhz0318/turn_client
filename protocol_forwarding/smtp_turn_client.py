@@ -76,9 +76,12 @@ class SMTPTURNClient:
             print(f"[+] Initiating TCP connection to {self.target_host}:{self.target_port}")
             print(f"[+] Resolved peer {self.target_host} to {peer_ip}")
             
-            connection_id = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.target_port, self.username)
+            connection_id, error_info = tcp_connect(self.control_sock, nonce, realm, integrity_key, peer_ip, self.target_port, self.username)
             if not connection_id:
-                print("[-] Failed to initiate TCP connection")
+                if error_info:
+                    print(f"[-] Failed to initiate TCP connection: {error_info.get('message', 'Unknown error')}")
+                else:
+                    print("[-] Failed to initiate TCP connection")
                 self.control_sock.close()
                 return False
                 

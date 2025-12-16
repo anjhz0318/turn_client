@@ -27,7 +27,8 @@ class ComprehensiveTURNTester:
                  password: str, realm: str = None, use_tls: bool = False,
                  output_file: str = "turn_test_results.json", reuse_connection: bool = True,
                  use_short_term_credential: bool = False, ip_file: Optional[str] = None,
-                 port_file: Optional[str] = None, sni_hostname: Optional[str] = None):
+                 port_file: Optional[str] = None, sni_hostname: Optional[str] = None,
+                 send_sni: bool = True):
         self.turn_server = turn_server
         self.turn_port = turn_port
         self.username = username
@@ -40,6 +41,7 @@ class ComprehensiveTURNTester:
         self.ip_file = ip_file
         self.port_file = port_file
         self.sni_hostname = sni_hostname
+        self.send_sni = send_sni
         
         # 初始化发现工具
         self.discovery = TURNServerDiscovery()
@@ -190,7 +192,8 @@ class ComprehensiveTURNTester:
             result = test_tcp_udp_turn(
                 server_address, self.username, self.password, 
                 self.realm, self.turn_server, self.use_tls, test_ip, test_port, False,
-                sni_hostname=self.sni_hostname  # 只有明确指定 --sni 时才传递
+                sni_hostname=self.sni_hostname,  # 只有明确指定 --sni 时才传递
+                send_sni=self.send_sni
             )
             capabilities['tcp_udp'] = result
         except Exception as e:
@@ -205,7 +208,8 @@ class ComprehensiveTURNTester:
             result = test_tcp_turn(
                 server_address, self.username, self.password, 
                 self.realm, self.turn_server, self.use_tls, test_ip, test_port, False,
-                sni_hostname=self.sni_hostname  # 只有明确指定 --sni 时才传递
+                sni_hostname=self.sni_hostname,  # 只有明确指定 --sni 时才传递
+                send_sni=self.send_sni
             )
             capabilities['tcp'] = result
         except Exception as e:
@@ -352,7 +356,7 @@ class ComprehensiveTURNTester:
                 return result
             
             # 尝试TCP连接
-            connection_id = tcp_connect(
+            connection_id, error_info = tcp_connect(
                 control_sock, nonce, realm, integrity_key,
                 target_ip, target_port, self.username
             )
@@ -361,7 +365,31 @@ class ComprehensiveTURNTester:
                 result['connection_success'] = True
                 result['connection_id'] = hex(connection_id) if connection_id else None
             else:
-                result['error'] = 'Connection failed'
+                # 根据错误类型设置详细的错误信息
+                if error_info:
+                    error_type = error_info.get('type', 'unknown')
+                    if error_type == 'error_447':
+                        result['error'] = f"TURN service 447 Error: {error_info.get('error_text', 'Unknown error')}"
+                        result['error_type'] = 'error_447'
+                        result['error_code'] = error_info.get('error_code', '447')
+                    elif error_type == 'timeout':
+                        result['error'] = 'Connection timeout (no response received)'
+                        result['error_type'] = 'timeout'
+                    elif error_type == 'no_data':
+                        result['error'] = 'No data received in Connect response'
+                        result['error_type'] = 'no_data'
+                    elif error_type == 'error_response':
+                        error_code = error_info.get('error_code', 'Unknown')
+                        error_text = error_info.get('error_text', 'Unknown error')
+                        result['error'] = f"TURN service {error_code} Error: {error_text}"
+                        result['error_type'] = 'error_response'
+                        result['error_code'] = error_code
+                    else:
+                        result['error'] = error_info.get('message', 'Connection failed')
+                        result['error_type'] = error_type
+                else:
+                    result['error'] = 'Connection failed'
+                    result['error_type'] = 'unknown'
             
             if should_close_connection:
                 control_sock.close()
@@ -500,6 +528,7 @@ def main():
     parser.add_argument('--ip-file', help='自定义测试IP列表文件')
     parser.add_argument('--port-file', help='自定义测试端口列表文件')
     parser.add_argument('--sni', help='自定义SNI主机名（用于TLS握手，如果未指定则使用TURN服务器域名）')
+    parser.add_argument('--no-sni', action='store_true', help='不发送SNI（禁用SNI扩展）')
     
     args = parser.parse_args()
     
@@ -524,7 +553,8 @@ def main():
         use_short_term_credential=False,  # 不再使用此参数，总是使用回退机制
         ip_file=args.ip_file,
         port_file=args.port_file,
-        sni_hostname=args.sni
+        sni_hostname=args.sni,  # 只有明确指定 --sni 时才传递
+        send_sni=not args.no_sni  # 如果指定 --no-sni，则send_sni=False
     )
     
     try:
