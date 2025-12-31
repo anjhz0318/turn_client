@@ -108,6 +108,17 @@ def receive_icmp_error(sock, timeout=3, use_tcp_udp=False):
             # UDP socket 使用 recvfrom
             data, addr = sock.recvfrom(2048)
             print(f"[+] Received {len(data)} bytes from {addr}")
+        
+        # 检查数据长度，如果小于20字节（STUN消息头最小长度），打印数据内容
+        if len(data) < 20:
+            print(f"[!] Received data is too short ({len(data)} bytes, need at least 20 bytes for STUN header)")
+            if len(data) > 0:
+                print(f"[!] Data content (hex): {data.hex()}")
+                print(f"[!] Data content (repr): {repr(data)}")
+            else:
+                print("[!] Data is empty (0 bytes)")
+            return (None, None, None)
+        
         msg_type, tid, attrs = parse_attrs(data)
         print(f"[+] Message type: 0x{msg_type:04x}, Attributes: {list(attrs.keys())}")
         

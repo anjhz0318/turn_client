@@ -2165,8 +2165,11 @@ def allocate_tcp(server_address=None, username=None, password=None, realm=None, 
     print("[-] All TCP IP addresses failed")
     return None
 
-def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, server_address=None, username=None, mi_algorithm=None):
+def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, server_address=None, username=None, mi_algorithm=None, clear_buffer=False):
     """创建权限，允许向指定对等方发送数据
+    
+    Args:
+        clear_buffer: 是否在发送请求前清空socket缓冲区（用于TCP+UDP模式）
     
     Args:
         mi_algorithm: 消息完整性算法类型 ('sha256', 'sha1', 'both', 或 None)
@@ -2222,15 +2225,154 @@ def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, ser
     else:
         req = build_msg(STUN_CREATE_PERMISSION_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
     
-    # 检查是否为SSL套接字（更准确的检测方法）
+    # 如果需要，清空socket缓冲区（用于TCP+UDP模式，避免残留数据干扰）
+    if clear_buffer:
+        original_timeout = sock.gettimeout()
+        sock.settimeout(0.1)
+        try:
+            cleared_count = 0
+            total_cleared = 0
+            while cleared_count < 20:  # 最多尝试20次，确保清空所有残留数据
+                try:
+                    data = sock.recv(4096)  # 增大缓冲区大小
+                    if not data:
+                        break
+                    cleared_count += 1
+                    total_cleared += len(data)
+                except (socket.timeout, socket.error, OSError):
+                    break
+            # 输出调试信息（即使没有清空数据也输出，确认逻辑执行了）
+            if total_cleared > 0:
+                print(f"[!] 清空了 {cleared_count} 个数据包，共 {total_cleared} 字节")
+            # 注意：不输出"缓冲区为空"的信息，避免输出过多
+        except Exception as e:
+            print(f"[!] 清空缓冲区时出错: {e}")
+        finally:
+            sock.settimeout(original_timeout if original_timeout else 10)
+    
+    # 检查socket类型：TCP (SOCK_STREAM) 还是 UDP (SOCK_DGRAM)
+    # 对于TCP socket（包括普通TCP和TCP+UDP模式），使用send/recv
+    # 对于UDP socket，使用sendto/recvfrom
+    is_tcp_socket = False
+    
+    # 方法1: 检查是否为SSL/TLS套接字（一定是TCP）
     if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
-        # SSL/TLS套接字
+        is_tcp_socket = True
+    # 方法2: 检查socket.type属性（最可靠的方法）
+    elif hasattr(sock, 'type'):
+        # SOCK_STREAM (1) = TCP, SOCK_DGRAM (2) = UDP
+        # 支持直接比较和整数值比较（兼容不同Python版本）
+        try:
+            sock_type = sock.type
+            # 多种比较方式以确保兼容性
+            if (sock_type == socket.SOCK_STREAM or 
+                (hasattr(sock_type, 'value') and getattr(sock_type, 'value', None) == 1) or
+                int(sock_type) == 1):  # SOCK_STREAM = 1
+                is_tcp_socket = True
+        except (ValueError, TypeError, AttributeError):
+            # 如果无法比较，继续尝试其他方法
+            pass
+    
+    # 方法3: 如果前两种方法都无法判断，尝试检查getpeername
+    # 注意：TCP socket在连接后会有getpeername，但未连接时也会失败
+    if not is_tcp_socket:
+        try:
+            # 尝试获取对等方地址，如果成功说明是已连接的TCP socket
+            sock.getpeername()
+            is_tcp_socket = True
+        except (AttributeError, OSError, socket.error):
+            # 没有getpeername或未连接
+            # 如果socket有type属性但前一步没判断出来，可能是比较失败
+            # 此时如果是未连接的TCP socket，仍然应该尝试使用recv
+            # 但为了安全，我们默认假设是UDP socket
+            pass
+    
+    if is_tcp_socket:
+        # TCP套接字（包括SSL/TLS和普通TCP）
         sock.send(req)
-        data = sock.recv(2000)
+        # 在TCP+UDP模式下，可能需要跳过ChannelData，读取STUN响应
+        # 循环读取直到找到STUN消息（magic cookie = 0x2112A442）
+        data = None
+        max_attempts = 20  # 增加尝试次数
+        attempt = 0
+        accumulated_data = b''  # 累积读取的数据
+        
+        while attempt < max_attempts:
+            try:
+                chunk = sock.recv(2000)
+                if not chunk:
+                    # 连接关闭
+                    break
+                
+                accumulated_data += chunk
+                
+                # 检查累积数据中是否有STUN消息
+                # STUN消息至少20字节，magic cookie在偏移4-8字节
+                if len(accumulated_data) >= 20:
+                    # 尝试从不同位置查找STUN消息
+                    found_stun = False
+                    for offset in range(0, min(len(accumulated_data) - 20, 100)):  # 最多检查前100字节
+                        if len(accumulated_data) >= offset + 20:
+                            try:
+                                magic = struct.unpack("!I", accumulated_data[offset+4:offset+8])[0]
+                                if magic == STUN_MAGIC_COOKIE:
+                                    # 找到STUN消息，提取完整消息
+                                    msg_len = struct.unpack("!H", accumulated_data[offset+2:offset+4])[0]
+                                    total_len = 20 + msg_len
+                                    if len(accumulated_data) >= offset + total_len:
+                                        data = accumulated_data[offset:offset+total_len]
+                                        found_stun = True
+                                        break
+                            except (struct.error, IndexError):
+                                continue
+                    
+                    if found_stun:
+                        break
+                
+                attempt += 1
+            except socket.timeout:
+                # 超时，检查累积数据
+                if len(accumulated_data) >= 20:
+                    # 尝试解析累积数据
+                    try:
+                        magic = struct.unpack("!I", accumulated_data[4:8])[0]
+                        if magic == STUN_MAGIC_COOKIE:
+                            msg_len = struct.unpack("!H", accumulated_data[2:4])[0]
+                            total_len = 20 + msg_len
+                            if len(accumulated_data) >= total_len:
+                                data = accumulated_data[:total_len]
+                                break
+                    except (struct.error, IndexError):
+                        pass
+                break
+            except Exception as e:
+                print(f"[!] 读取数据时出错: {e}")
+                break
+        
+        if data is None:
+            raise socket.timeout("Timeout waiting for STUN response")
     else:
         # UDP套接字
-        sock.sendto(req, server_address)
-        data, _ = sock.recvfrom(2000)
+        # 但为了安全，如果socket有type属性且是SOCK_STREAM，仍然使用TCP方式
+        # 这可以处理检测失败的情况
+        if hasattr(sock, 'type'):
+            try:
+                if int(sock.type) == 1:  # SOCK_STREAM
+                    # 实际上是TCP socket，但检测失败，使用TCP方式
+                    sock.send(req)
+                    data = sock.recv(2000)
+                else:
+                    # 确实是UDP socket
+                    sock.sendto(req, server_address)
+                    data, _ = sock.recvfrom(2000)
+            except (ValueError, TypeError, AttributeError):
+                # 无法判断，尝试UDP方式
+                sock.sendto(req, server_address)
+                data, _ = sock.recvfrom(2000)
+        else:
+            # 没有type属性，尝试UDP方式
+            sock.sendto(req, server_address)
+            data, _ = sock.recvfrom(2000)
     
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] CreatePermission response:", attrs)
@@ -2246,8 +2388,11 @@ def create_permission(sock, nonce, realm, integrity_key, peer_ip, peer_port, ser
     
     return True
 
-def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, server_address=None, username=None, mi_algorithm=None):
+def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_number, server_address=None, username=None, mi_algorithm=None, clear_buffer=False):
     """绑定通道号到对等方地址
+    
+    Args:
+        clear_buffer: 是否在发送请求前清空socket缓冲区（用于TCP+UDP模式）
     
     Args:
         mi_algorithm: 消息完整性算法类型 ('sha256', 'sha1', 'both', 或 None)
@@ -2305,15 +2450,154 @@ def channel_bind(sock, nonce, realm, integrity_key, peer_ip, peer_port, channel_
     else:
         req = build_msg(STUN_CHANNEL_BIND_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
     
-    # 检查是否为SSL套接字（更准确的检测方法）
+    # 如果需要，清空socket缓冲区（用于TCP+UDP模式，避免残留数据干扰）
+    if clear_buffer:
+        original_timeout = sock.gettimeout()
+        sock.settimeout(0.1)
+        try:
+            cleared_count = 0
+            total_cleared = 0
+            while cleared_count < 20:  # 最多尝试20次，确保清空所有残留数据
+                try:
+                    data = sock.recv(4096)  # 增大缓冲区大小
+                    if not data:
+                        break
+                    cleared_count += 1
+                    total_cleared += len(data)
+                except (socket.timeout, socket.error, OSError):
+                    break
+            # 输出调试信息（即使没有清空数据也输出，确认逻辑执行了）
+            if total_cleared > 0:
+                print(f"[!] 清空了 {cleared_count} 个数据包，共 {total_cleared} 字节")
+            # 注意：不输出"缓冲区为空"的信息，避免输出过多
+        except Exception as e:
+            print(f"[!] 清空缓冲区时出错: {e}")
+        finally:
+            sock.settimeout(original_timeout if original_timeout else 10)
+    
+    # 检查socket类型：TCP (SOCK_STREAM) 还是 UDP (SOCK_DGRAM)
+    # 对于TCP socket（包括普通TCP和TCP+UDP模式），使用send/recv
+    # 对于UDP socket，使用sendto/recvfrom
+    is_tcp_socket = False
+    
+    # 方法1: 检查是否为SSL/TLS套接字（一定是TCP）
     if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
-        # SSL/TLS套接字
+        is_tcp_socket = True
+    # 方法2: 检查socket.type属性（最可靠的方法）
+    elif hasattr(sock, 'type'):
+        # SOCK_STREAM (1) = TCP, SOCK_DGRAM (2) = UDP
+        # 支持直接比较和整数值比较（兼容不同Python版本）
+        try:
+            sock_type = sock.type
+            # 多种比较方式以确保兼容性
+            if (sock_type == socket.SOCK_STREAM or 
+                (hasattr(sock_type, 'value') and getattr(sock_type, 'value', None) == 1) or
+                int(sock_type) == 1):  # SOCK_STREAM = 1
+                is_tcp_socket = True
+        except (ValueError, TypeError, AttributeError):
+            # 如果无法比较，继续尝试其他方法
+            pass
+    
+    # 方法3: 如果前两种方法都无法判断，尝试检查getpeername
+    # 注意：TCP socket在连接后会有getpeername，但未连接时也会失败
+    if not is_tcp_socket:
+        try:
+            # 尝试获取对等方地址，如果成功说明是已连接的TCP socket
+            sock.getpeername()
+            is_tcp_socket = True
+        except (AttributeError, OSError, socket.error):
+            # 没有getpeername或未连接
+            # 如果socket有type属性但前一步没判断出来，可能是比较失败
+            # 此时如果是未连接的TCP socket，仍然应该尝试使用recv
+            # 但为了安全，我们默认假设是UDP socket
+            pass
+    
+    if is_tcp_socket:
+        # TCP套接字（包括SSL/TLS和普通TCP）
         sock.send(req)
-        data = sock.recv(2000)
+        # 在TCP+UDP模式下，可能需要跳过ChannelData，读取STUN响应
+        # 循环读取直到找到STUN消息（magic cookie = 0x2112A442）
+        data = None
+        max_attempts = 20  # 增加尝试次数
+        attempt = 0
+        accumulated_data = b''  # 累积读取的数据
+        
+        while attempt < max_attempts:
+            try:
+                chunk = sock.recv(2000)
+                if not chunk:
+                    # 连接关闭
+                    break
+                
+                accumulated_data += chunk
+                
+                # 检查累积数据中是否有STUN消息
+                # STUN消息至少20字节，magic cookie在偏移4-8字节
+                if len(accumulated_data) >= 20:
+                    # 尝试从不同位置查找STUN消息
+                    found_stun = False
+                    for offset in range(0, min(len(accumulated_data) - 20, 100)):  # 最多检查前100字节
+                        if len(accumulated_data) >= offset + 20:
+                            try:
+                                magic = struct.unpack("!I", accumulated_data[offset+4:offset+8])[0]
+                                if magic == STUN_MAGIC_COOKIE:
+                                    # 找到STUN消息，提取完整消息
+                                    msg_len = struct.unpack("!H", accumulated_data[offset+2:offset+4])[0]
+                                    total_len = 20 + msg_len
+                                    if len(accumulated_data) >= offset + total_len:
+                                        data = accumulated_data[offset:offset+total_len]
+                                        found_stun = True
+                                        break
+                            except (struct.error, IndexError):
+                                continue
+                    
+                    if found_stun:
+                        break
+                
+                attempt += 1
+            except socket.timeout:
+                # 超时，检查累积数据
+                if len(accumulated_data) >= 20:
+                    # 尝试解析累积数据
+                    try:
+                        magic = struct.unpack("!I", accumulated_data[4:8])[0]
+                        if magic == STUN_MAGIC_COOKIE:
+                            msg_len = struct.unpack("!H", accumulated_data[2:4])[0]
+                            total_len = 20 + msg_len
+                            if len(accumulated_data) >= total_len:
+                                data = accumulated_data[:total_len]
+                                break
+                    except (struct.error, IndexError):
+                        pass
+                break
+            except Exception as e:
+                print(f"[!] 读取数据时出错: {e}")
+                break
+        
+        if data is None:
+            raise socket.timeout("Timeout waiting for STUN response")
     else:
         # UDP套接字
-        sock.sendto(req, server_address)
-        data, _ = sock.recvfrom(2000)
+        # 但为了安全，如果socket有type属性且是SOCK_STREAM，仍然使用TCP方式
+        # 这可以处理检测失败的情况
+        if hasattr(sock, 'type'):
+            try:
+                if int(sock.type) == 1:  # SOCK_STREAM
+                    # 实际上是TCP socket，但检测失败，使用TCP方式
+                    sock.send(req)
+                    data = sock.recv(2000)
+                else:
+                    # 确实是UDP socket
+                    sock.sendto(req, server_address)
+                    data, _ = sock.recvfrom(2000)
+            except (ValueError, TypeError, AttributeError):
+                # 无法判断，尝试UDP方式
+                sock.sendto(req, server_address)
+                data, _ = sock.recvfrom(2000)
+        else:
+            # 没有type属性，尝试UDP方式
+            sock.sendto(req, server_address)
+            data, _ = sock.recvfrom(2000)
     
     msg_type, tid, attrs = parse_attrs(data)
     print("[+] ChannelBind response:", attrs)
