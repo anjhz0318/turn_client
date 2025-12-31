@@ -27,10 +27,6 @@ from turn_utils import (
     channel_bind,
     channel_data,
     resolve_server_address,
-    gen_tid,
-    stun_attr,
-    build_msg,
-    parse_attrs,
     resolve_peer_address
 )
 from turn_utils.test_turn_capabilities import allocate_with_fallback
@@ -42,6 +38,12 @@ from turn_utils.turn_client import (
     STUN_ATTR_FINGERPRINT,
     STUN_MAGIC_COOKIE
 )
+# 直接从turn_client导入这些函数
+import turn_utils.turn_client as turn_client
+gen_tid = turn_client.gen_tid
+stun_attr = turn_client.stun_attr
+build_msg = turn_client.build_msg
+parse_attrs = turn_client.parse_attrs
 from config import DEFAULT_TURN_SERVER, DEFAULT_TURN_PORT
 
 # STUN/TURN Refresh 常量（RFC 8656）
@@ -196,20 +198,139 @@ def build_dns_query(domain, query_type=1):
     
     return header + query_name + query_type_class, transaction_id
 
-def send_dns_query(sock, channel_number, dns_server_ip, dns_server_port, server_address, domain="www.example.com"):
-    """通过TURN通道发送DNS查询"""
+def parse_dns_response(data):
+    """解析DNS响应"""
+    if len(data) < 12:
+        return None
+        
+    # 解析头部
+    transaction_id, flags, questions, answer_rrs, authority_rrs, additional_rrs = \
+        struct.unpack("!HHHHHH", data[:12])
+    
+    print(f"[+] DNS Response - ID: {transaction_id}, Flags: 0x{flags:04x}")
+    print(f"[+] Questions: {questions}, Answers: {answer_rrs}")
+    
+    # 解析问题部分
+    pos = 12
+    for _ in range(questions):
+        # 跳过查询名称
+        while pos < len(data) and data[pos] != 0:
+            pos += data[pos] + 1
+        pos += 5  # 跳过结束标记和类型、类别
+        
+    # 解析答案部分
+    answers = []
+    for _ in range(answer_rrs):
+        if pos >= len(data):
+            break
+            
+        # 解析名称（可能是压缩指针）
+        name_start = pos
+        if data[pos] & 0xC0 == 0xC0:  # 压缩指针
+            pos += 2
+        else:
+            while pos < len(data) and data[pos] != 0:
+                pos += data[pos] + 1
+            pos += 1
+            
+        if pos + 10 > len(data):
+            break
+            
+        # 解析资源记录
+        query_type, query_class, ttl, data_length = \
+            struct.unpack("!HHIH", data[pos:pos+10])
+        pos += 10
+        
+        if pos + data_length > len(data):
+            break
+            
+        rdata = data[pos:pos+data_length]
+        pos += data_length
+        
+        answers.append({
+            'type': query_type,
+            'class': query_class,
+            'ttl': ttl,
+            'data': rdata
+        })
+        
+    return {
+        'transaction_id': transaction_id,
+        'flags': flags,
+        'answers': answers
+    }
+
+def send_dns_query_and_receive(sock, channel_number, dns_server_ip, dns_server_port, server_address, domain="www.example.com", timeout=10):
+    """通过TURN通道发送DNS查询并接收响应"""
     print(f"[+] Sending DNS query for {domain} to {dns_server_ip}:{dns_server_port}")
     
     # 构建DNS查询包
     query_packet, transaction_id = build_dns_query(domain)
     
     # 通过TURN通道发送查询
-    if channel_data(sock, channel_number, query_packet, server_address):
-        print(f"[+] DNS query sent (transaction ID: {transaction_id})")
-        return True
-    else:
+    if not channel_data(sock, channel_number, query_packet, server_address):
         print(f"[-] Failed to send DNS query")
-        return False
+        return None
+    
+    print(f"[+] DNS query sent (transaction ID: {transaction_id})")
+    print(f"[+] Waiting for DNS response...")
+    
+    # 接收响应
+    try:
+        sock.settimeout(timeout)
+        if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket' or (hasattr(sock, 'type') and sock.type == socket.SOCK_STREAM):
+            data = sock.recv(1024)
+        else:
+            data, addr = sock.recvfrom(1024)
+        
+        # 检查是否是ChannelData消息
+        if len(data) >= 4:
+            channel_number_received = struct.unpack("!H", data[:2])[0]
+            data_length = struct.unpack("!H", data[2:4])[0]
+            
+            if channel_number_received == channel_number and len(data) >= 4 + data_length:
+                dns_data = data[4:4+data_length]
+                response = parse_dns_response(dns_data)
+                if response:
+                    print(f"[+] DNS response received:")
+                    print(f"    Transaction ID: {response['transaction_id']}")
+                    print(f"    Flags: 0x{response['flags']:04x}")
+                    print(f"    Answers: {len(response['answers'])}")
+                    
+                    # 解析并显示答案
+                    for i, answer in enumerate(response['answers']):
+                        print(f"    Answer {i+1}:")
+                        print(f"      Type: {answer['type']} ({'A' if answer['type'] == 1 else 'AAAA' if answer['type'] == 28 else 'Other'})")
+                        print(f"      TTL: {answer['ttl']}")
+                        
+                        if answer['type'] == 1:  # A记录
+                            if len(answer['data']) == 4:
+                                ip = socket.inet_ntoa(answer['data'])
+                                print(f"      A Record: {ip}")
+                        elif answer['type'] == 28:  # AAAA记录
+                            if len(answer['data']) == 16:
+                                ipv6 = socket.inet_ntop(socket.AF_INET6, answer['data'])
+                                print(f"      AAAA Record: {ipv6}")
+                        else:
+                            print(f"      Data: {answer['data'].hex()}")
+                    
+                    return response
+                else:
+                    print(f"[-] Failed to parse DNS response")
+                    return None
+            else:
+                print(f"[-] Invalid channel data format")
+                return None
+        else:
+            print(f"[-] Response too short")
+            return None
+            
+    except socket.timeout:
+        print(f"[+] No DNS response received within timeout")
+        return None
+    except Exception as e:
+        print(f"[-] Error receiving DNS response: {e}")
+        return None
 
 def main():
     parser = argparse.ArgumentParser(description='模拟正常使用TURN的用户行为')
@@ -246,85 +367,70 @@ def main():
     print(f"[+] Run Time: {args.run_time} seconds")
     print()
     
-    # 1. 分配UDP TURN中继地址
-    print("[1/4] 分配UDP TURN中继地址...")
-    result, is_short_term = allocate_with_fallback(
-        server_address,
-        args.username,
-        args.password,
-        args.realm,
-        args.turn_server,
-    )
-    
-    if not result:
-        print("[-] Failed to allocate TURN relay")
-        return
-    
-    sock, nonce, realm, integrity_key, actual_server_address, *extra = result
-    mi_algorithm = extra[0] if extra else None
-    
-    print(f"[+] UDP TURN allocation successful")
-    print(f"[+] Relay address: {actual_server_address}")
-    print()
-    
-    # 2. 创建权限，允许向DNS服务器发送数据
-    print("[2/4] 创建权限...")
-    if not create_permission(sock, nonce, realm, integrity_key, 
-                           args.dns_server, args.dns_port, actual_server_address, args.username, mi_algorithm):
-        print("[-] Failed to create permission")
-        sock.close()
-        return
-    print("[+] Permission created")
-    print()
-    
-    # 3. 绑定通道
-    print("[3/4] 绑定通道...")
-    channel_number = 0x4000
-    if not channel_bind(sock, nonce, realm, integrity_key, 
-                       args.dns_server, args.dns_port, channel_number, actual_server_address, args.username, mi_algorithm):
-        print("[-] Failed to bind channel")
-        sock.close()
-        return
-    print(f"[+] Channel {channel_number} bound successfully")
-    print()
-    
-    # 4. 发送第一个DNS查询
-    print("[4/4] 发送第一个DNS查询...")
-    send_dns_query(sock, channel_number, args.dns_server, args.dns_port, actual_server_address, args.domain)
-    print()
-    
-    # 5. 定时发送refresh并再次发送DNS查询
+    # 开始DNS查询循环（每次查询都新建allocation）
     print("="*70)
-    print("🔄 开始定时刷新和DNS查询循环...")
+    print("🔄 开始DNS查询循环（每次查询新建allocation）...")
     print("="*70)
     
     start_time = time.time()
-    last_refresh_time = start_time
-    query_count = 1
+    query_count = 0
     
     try:
         while time.time() - start_time < args.run_time:
-            current_time = time.time()
-            
-            # 检查是否需要refresh
-            if current_time - last_refresh_time >= args.refresh_interval:
-                print(f"\n[{time.strftime('%H:%M:%S')}] 发送Refresh请求...")
-                success, lifetime = refresh_allocation(sock, nonce, realm, integrity_key, 
-                                                       actual_server_address, args.username, 
-                                                       mi_algorithm=mi_algorithm)
-                if success:
-                    last_refresh_time = current_time
-                    if lifetime:
-                        print(f"[+] Allocation refreshed, lifetime: {lifetime} seconds")
-                else:
-                    print("[-] Refresh failed, but continuing...")
-                print()
-            
-            # 发送DNS查询
             query_count += 1
-            print(f"[{time.strftime('%H:%M:%S')}] 发送DNS查询 #{query_count}...")
-            send_dns_query(sock, channel_number, args.dns_server, args.dns_port, 
-                          actual_server_address, args.domain)
+            print(f"\n[{time.strftime('%H:%M:%S')}] ========== DNS查询 #{query_count} ==========")
+            
+            # 1. 分配UDP TURN中继地址（每次查询都新建）
+            print(f"[1/4] 分配UDP TURN中继地址...")
+            result, is_short_term = allocate_with_fallback(
+                server_address,
+                args.username,
+                args.password,
+                args.realm,
+                args.turn_server,
+            )
+            
+            if not result:
+                print("[-] Failed to allocate TURN relay, skipping this query")
+                time.sleep(5)
+                continue
+            
+            sock, nonce, realm, integrity_key, actual_server_address, *extra = result
+            mi_algorithm = extra[0] if extra else None
+            
+            print(f"[+] UDP TURN allocation successful")
+            print(f"[+] Relay address: {actual_server_address}")
+            
+            # 2. 创建权限，允许向DNS服务器发送数据
+            print(f"[2/4] 创建权限...")
+            if not create_permission(sock, nonce, realm, integrity_key, 
+                                   args.dns_server, args.dns_port, actual_server_address, args.username, mi_algorithm):
+                print("[-] Failed to create permission, closing allocation")
+                sock.close()
+                time.sleep(5)
+                continue
+            print("[+] Permission created")
+            
+            # 3. 绑定通道
+            print(f"[3/4] 绑定通道...")
+            channel_number = 0x4000
+            if not channel_bind(sock, nonce, realm, integrity_key, 
+                               args.dns_server, args.dns_port, channel_number, actual_server_address, args.username, mi_algorithm):
+                print("[-] Failed to bind channel, closing allocation")
+                sock.close()
+                time.sleep(5)
+                continue
+            print(f"[+] Channel {channel_number} bound successfully")
+            
+            # 4. 发送DNS查询并接收响应
+            print(f"[4/4] 发送DNS查询并接收响应...")
+            response = send_dns_query_and_receive(sock, channel_number, args.dns_server, args.dns_port, 
+                                                  actual_server_address, args.domain)
+            
+            # 关闭allocation（每次查询后关闭）
+            print(f"[+] 关闭allocation...")
+            sock.close()
+            print(f"[+] DNS查询 #{query_count} 完成\n")
             
             # 等待一段时间再发送下一次查询
             time.sleep(10)
@@ -336,9 +442,7 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        print("\n[+] 清理连接...")
-        sock.close()
-        print("[+] 完成")
+        print("\n[+] 完成")
 
 if __name__ == "__main__":
     main()
