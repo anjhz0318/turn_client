@@ -10,6 +10,8 @@ import os
 import socket
 import struct
 import time
+import json
+from datetime import datetime
 
 # 添加路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'turn_utils'))
@@ -52,7 +54,8 @@ class StandardAbilityTester:
             ("192.168.0.1", 443),
             ("172.17.0.1", 443),
             ("169.254.169.254", 80),
-            ("10.233.0.1", 443)
+            ("10.233.0.1", 443),
+            ("127.0.0.1",443)
         ]
         self.udp_public_targets = [
             ("8.8.8.8", 53),
@@ -61,7 +64,8 @@ class StandardAbilityTester:
         self.udp_internal_targets = [
             ("192.168.0.1", 53),
             ("172.17.0.1", 53),
-            ("10.233.0.1", 53)
+            ("10.233.0.1", 53),
+            ("127.0.0.1",53)
         ]
     
     def _get_first_ip(self):
@@ -468,6 +472,70 @@ class StandardAbilityTester:
             for ip, port, success, msg in udp_results.get('internal', []):
                 status = "✓" if success else "✗"
                 print(f"    {status} {ip}:{port} - {msg}")
+        
+        # 返回测试结果用于JSON输出
+        return {
+            'capabilities': capabilities,
+            'tcp_results': tcp_results,
+            'udp_results': udp_results
+        }
+    
+    def save_results_to_json(self, domain, results, output_file='turn_test_results.json'):
+        """将测试结果保存到JSON文件（追加模式）"""
+        # 读取现有JSON文件
+        existing_data = {}
+        if os.path.exists(output_file):
+            try:
+                with open(output_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"[!] 读取现有JSON文件失败: {e}，将创建新文件")
+                existing_data = {}
+        
+        # 准备要保存的数据
+        result_data = {
+            'timestamp': datetime.now().isoformat(),
+            'server_info': {
+                'turn_server': self.turn_server,
+                'turn_port': self.turn_port,
+                'server_ip': self.server_ip,
+                'username': self.username,
+                'use_tls': self.use_tls
+            },
+            'capabilities': results['capabilities'],
+            'tcp_results': self._format_results_for_json(results['tcp_results']),
+            'udp_results': self._format_results_for_json(results['udp_results'])
+        }
+        
+        # 添加或更新domain对应的数据
+        existing_data[domain] = result_data
+        
+        # 写回JSON文件
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            print(f"\n[+] 测试结果已保存到: {output_file} (domain: {domain})")
+        except IOError as e:
+            print(f"[-] 保存JSON文件失败: {e}")
+    
+    def _format_results_for_json(self, results):
+        """将测试结果格式化为JSON友好的格式"""
+        if not results:
+            return {}
+        
+        formatted = {}
+        for category in ['public', 'internal']:
+            if category in results:
+                formatted[category] = []
+                for ip, port, success, msg in results[category]:
+                    formatted[category].append({
+                        'target_ip': ip,
+                        'target_port': port,
+                        'success': success,
+                        'message': msg
+                    })
+        
+        return formatted
 
 
 def main():
@@ -478,6 +546,8 @@ def main():
     parser.add_argument("--password", required=True, help="TURN密码")
     parser.add_argument("--realm", help="TURN认证域")
     parser.add_argument("--tls", action="store_true", help="使用TLS")
+    parser.add_argument("--domain", required=True, help="域名标识（用作JSON输出中的key）")
+    parser.add_argument("--output", default="turn_test_results.json", help="JSON输出文件路径（默认: turn_test_results.json）")
     
     args = parser.parse_args()
     
@@ -486,7 +556,8 @@ def main():
             args.turn_server, args.turn_port,
             args.username, args.password, args.realm, args.tls
         )
-        tester.run()
+        results = tester.run()
+        tester.save_results_to_json(args.domain, results, args.output)
     except Exception as e:
         print(f"[-] 测试失败: {e}")
         import traceback
