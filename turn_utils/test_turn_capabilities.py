@@ -429,24 +429,14 @@ def test_udp_turn(server_address, username, password, realm, server_hostname, ta
         print(f"✅ UDP TURN分配成功 (实际服务器: {actual_server_address})")
         
         # 2. 创建权限
-        print("\n[2/3] 创建权限...")
+        print("\n[2/2] 创建权限...")
         if not create_permission(sock, nonce, realm, integrity_key, target_ip, target_port, actual_server_address, username):
             print("❌ 创建权限失败")
             sock.close()
             return False
         print("✅ 权限创建成功")
         
-        # 3. 绑定通道
-        print("\n[3/3] 绑定通道...")
-        import random
-        channel_number = random.randint(0x4000, 0x4FFF)
-        if not channel_bind(sock, nonce, realm, integrity_key, target_ip, target_port, channel_number, actual_server_address, username):
-            print("❌ 通道绑定失败")
-            sock.close()
-            return False
-        print(f"✅ 通道绑定成功 (通道号: {channel_number:04x})")
-        
-        print("✅ UDP TURN连接建立完成")
+        print("✅ UDP TURN测试完成（仅到创建权限，不进行转发）")
         sock.close()
         return True
         

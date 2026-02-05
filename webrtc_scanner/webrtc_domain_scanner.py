@@ -277,53 +277,49 @@ def analyze_webrtc_with_ai(domain: str, elements_data: Dict, api_key: str, model
     
     # 构建提示词
     prompt = f"""
-你是一名精通前端与实时通信技术的分析专家。现在我将提供一个网站主页的页面元素信息（包括按钮、链接、输入框的文本和属性），请你判断该网站是否使用了 WebRTC（Web Real-Time Communication） 技术。
-请你从 网站业务语义 进行分析，并按以下步骤输出结果。
+You are an analysis expert proficient in frontend and real-time communication technologies. I will now provide you with homepage element information of a website (including the text and attributes of buttons, links, and input fields). Please determine whether the website is likely to use the TURN (Traversal Using Relays around NAT) technology in WebRTC.
 
-从页面的标题、按钮文本、链接文本、输入框的 placeholder 或 value 等元素中，推断网站的业务类型。
-若网站功能与以下任意场景相关，则可能使用 WebRTC：
+Specifically, please analyze from the website’s **business semantics perspective**. If elements such as the page title, button text, link text, or input field placeholders or values allow you to infer that the website’s business type is **directly related** to any of the following scenarios, then the website is highly likely to use TURN services:
 
-（1）视频通信类场景
+1. Real-time audio/video conference platforms: Enterprise or personal conference platforms, providing instant messaging, audio calls, video calls, online meetings, and screen sharing.
+2. Cloud-based RTC PaaS and Programmable WebRTC Infrastructure Platforms: Cloud-based real-time audio/video Platform-as-a-Service (PaaS) offerings provided and fully managed by a vendor and developer- or infrastructure-focused platforms providing WebRTC building blocks. Customers can quickly integrate real-time voice, video, and interactive media capabilities without managing the underlying infrastructure. The provider handles all signaling, media servers, scaling, and STUN/TURN infrastructure.
+3. Enterprise collaboration & communication platforms: Enterprise-facing platforms providing internal messaging, audio/video calls, online meetings, team collaboration, and contact center operations.
+4. Social media real-time communication: Social networking service offering built-in real-time audio and video calling features based on WebRTC.
+5. Remote access computers: Remote desktop, Cloud PC and screen‑sharing services that leverage WebRTC relay infrastructure (TURN) to connect devices. 
+6. Professional real‑time remote audio/video production and collaboration: Platforms and software for media professionals that enable real-time remote collaboration, streaming, and joint sessions across networks. Use cases include remote recording, live editing, and casting/audition sessions.
+7. Online education & tutoring platforms: Platforms that provide interactive live lessons, tutoring sessions, or remote assessments with real‑time audio/video, screen sharing, and collaborative tools (such as whiteboards or shared materials).
+8. Secure professional real‑time consultations and interactions: Platforms providing real‑time, high‑trust interactive sessions such as healthcare, document verification, job hiring or professional advisory services.
+9. Remote browser/device testing platform: Cloud‑hosted service that lets developers and QA engineers interact with real browsers and devices over the network for cross‑browser and cross‑platform testing.
+10. Remote device monitoring & IoT / cloud camera platforms: Platforms and services that enable real-time remote monitoring, control, or streaming from devices, endpoints, or IoT devices/cameras.
+11. Cloud‑based IP Telephony & Virtual PBX platforms: Cloud-hosted telephony and virtual PBX services that provide real‑time voice communication for businesses via SIP, softphones, mobile apps, or web clients. These platforms typically include features such as call routing, IVR, queues, recordings, CRM integrations.
+12. Anonymous Real‑Time Chat: Platforms that provide anonymous or semi-anonymous real-time text, voice, or video random chat.
+13. Ultra-low-latency live streaming & interactive broadcast platforms： Platforms that provide ultra-low-latency live video streaming (typically sub-second latency) combined with real-time audience interaction capabilities(reactions, polls, betting, fan interaction).
+14. Cloud-interactive digital gaming: Platforms with online games, virtual worlds, interactive experiences and internally integrate real-time communication technologies.
 
-视频会议、在线会议室、多方会议、远程会议、视频通话、一对一视频聊天、视频面试、在线问诊、远程课堂、虚拟会议平台
+If the website’s business directly includes any of the above types, it can be considered “Confirmed Use”.
+If the website’s business does not directly include any of the above types but shows some association, it can be considered “Possible Use”.
+If the website’s business has little association with the above types, it can be considered “No Evidence of Use”.
 
-（2）语音与聊天类场景
+3. Output Format
 
-实时语音通话、语音聊天室、语音房间、语音匹配、语音客服、即时聊天、实时沟通、在线对讲
+Based on the above analysis, output a structured JSON:
 
-（3）社交与互动类场景
-
-随机视频聊天、在线视频配对、实时约会、面对面通信、互动社交、视频见面
-
-（4）协作与远程操作类场景
-
-屏幕共享、远程协作、在线演示、多人白板、在线办公、远程控制、在线辅导
-
-（5）媒体与直播类场景
-
-实时直播、低延迟推流、互动直播、视频客服、虚拟前台、远程展示、实时媒体播放
-
-若页面元素中出现这些功能描述或提示性词汇，可判定该网站具备 WebRTC 通信能力。
-
-3. 输出格式
-
-综合上述分析，输出一个结构化 JSON：
 {{
-  "webrtc_usage": "确定使用 | 可能使用 | 未发现使用",
-  "evidence": ["关键词或API片段1", "业务语义线索2", "接口路径3"],
-  "reasoning": "简要说明推理过程"
+  "webrtc_usage": "Confirmed Use | Possible Use | No Evidence of Use",
+  "evidence": ["Keyword or API snippet 1", "Business semantic clue 2", "Button name 3"],
+  "reasoning": "Brief explanation of the reasoning process"
 }}
 
 
-以下是网站页面元素信息
+The following is the website page element information:
 
-域名: {domain}
+Domain: {domain}
 URL: {elements_data['url']}
-状态码: {elements_data['status_code']}
-内容类型: {elements_data['content_type']}
-标题: {title}
+Status Code: {elements_data['status_code']}
+Content Type: {elements_data['content_type']}
+Title: {title}
 
-页面元素信息:
+Page element information:
 {elements_text}
 
 """
@@ -411,13 +407,13 @@ URL: {elements_data['url']}
                 else:
                     # 如果没有找到 JSON，返回原始内容
                     return {
-                        "webrtc_usage": "未发现使用",
+                        "webrtc_usage": "No Evidence of Use",
                         "evidence": [],
                         "reasoning": "无法从响应中提取 JSON，原始响应：" + full_content[:200]
                     }
             except json.JSONDecodeError as e:
                 return {
-                    "webrtc_usage": "未发现使用",
+                    "webrtc_usage": "No Evidence of Use",
                     "evidence": [],
                     "reasoning": f"AI 响应格式错误: {str(e)}",
                     "raw_response": full_content[:500]
@@ -666,10 +662,10 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
     elements = elements_data.get('elements', {})
     print(f"[线程 {thread_id}] 提取的元素: {len(elements.get('buttons', []))} 个按钮, {len(elements.get('links', []))} 个链接, {len(elements.get('inputs', []))} 个输入框")
     
-    # 两阶段 AI 分析：先用快速模型，如果出错或结果是"可能使用"则用更准确的模型重新判断
+    # 两阶段 AI 分析：先用快速模型，如果出错或结果是"Possible Use"则用更准确的模型重新判断
     print(f"[线程 {thread_id}] 第一阶段：使用快速模型 (gemini-2.0-flash-exp) 分析 WebRTC 服务...")
-    ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
-    
+    #ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
+    ai_result = None
     # 如果第一次判断失败（返回 None），使用更准确的模型重新判断
     if not ai_result:
         print(f"[线程 {thread_id}] 第一阶段分析失败，使用更准确模型 (gemini-2.5-pro) 重新尝试...")
@@ -678,9 +674,9 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
             print(f"[线程 {thread_id}] 使用昂贵模型分析成功")
         else:
             print(f"[线程 {thread_id}] 昂贵模型分析也失败")
-    # 如果第一次判断结果是"可能使用"，使用更准确的模型重新判断
-    elif ai_result.get("webrtc_usage") == "可能使用":
-        print(f"[线程 {thread_id}] 第一阶段结果为'可能使用'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
+    # 如果第一次判断结果是"Possible Use"，使用更准确的模型重新判断
+    elif ai_result.get("webrtc_usage") == "Possible Use":
+        print(f"[线程 {thread_id}] 第一阶段结果为'Possible Use'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
         second_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
         if second_result:
             # 以第二次判断的结果为准
@@ -691,17 +687,17 @@ def process_domain(domain_info: Dict, start_line: int, api_key: str, model: str,
     
     if ai_result:
         # 解析新的 JSON 格式
-        webrtc_usage = ai_result.get("webrtc_usage", "未发现使用")
+        webrtc_usage = ai_result.get("webrtc_usage", "No Evidence of Use")
         evidence = ai_result.get("evidence", [])
         reasoning = ai_result.get("reasoning", "")
         
         # 将 webrtc_usage 转换为布尔值
-        has_webrtc = webrtc_usage in ["确定使用", "可能使用"]
+        has_webrtc = webrtc_usage in ["Confirmed Use", "Possible Use"]
         
         # 根据 webrtc_usage 确定置信度
-        if webrtc_usage == "确定使用":
+        if webrtc_usage == "Confirmed Use":
             confidence = "high"
-        elif webrtc_usage == "可能使用":
+        elif webrtc_usage == "Possible Use":
             confidence = "medium"
         else:
             confidence = "low"
@@ -968,7 +964,7 @@ def main():
             elements = elements_data.get('elements', {})
             print(f"    提取的元素: {len(elements.get('buttons', []))} 个按钮, {len(elements.get('links', []))} 个链接, {len(elements.get('inputs', []))} 个输入框")
             
-            # 两阶段 AI 分析：先用快速模型，如果出错或结果是"可能使用"则用更准确的模型重新判断
+            # 两阶段 AI 分析：先用快速模型，如果出错或结果是"Possible Use"则用更准确的模型重新判断
             print(f"[*] 第一阶段：使用快速模型 (gemini-2.0-flash-exp) 分析 WebRTC 服务...")
             ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
             
@@ -980,9 +976,9 @@ def main():
                     print(f"[+] 使用昂贵模型分析成功")
                 else:
                     print(f"[!] 昂贵模型分析也失败")
-            # 如果第一次判断结果是"可能使用"，使用更准确的模型重新判断
-            elif ai_result.get("webrtc_usage") == "可能使用":
-                print(f"[*] 第一阶段结果为'可能使用'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
+            # 如果第一次判断结果是"Possible Use"，使用更准确的模型重新判断
+            elif ai_result.get("webrtc_usage") == "Possible Use":
+                print(f"[*] 第一阶段结果为'Possible Use'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
                 second_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
                 if second_result:
                     # 以第二次判断的结果为准
@@ -993,17 +989,17 @@ def main():
             
             if ai_result:
                 # 解析新的 JSON 格式
-                webrtc_usage = ai_result.get("webrtc_usage", "未发现使用")
+                webrtc_usage = ai_result.get("webrtc_usage", "No Evidence of Use")
                 evidence = ai_result.get("evidence", [])
                 reasoning = ai_result.get("reasoning", "")
                 
                 # 将 webrtc_usage 转换为布尔值
-                has_webrtc = webrtc_usage in ["确定使用", "可能使用"]
+                has_webrtc = webrtc_usage in ["Confirmed Use", "Possible Use"]
                 
                 # 根据 webrtc_usage 确定置信度
-                if webrtc_usage == "确定使用":
+                if webrtc_usage == "Confirmed Use":
                     confidence = "high"
-                elif webrtc_usage == "可能使用":
+                elif webrtc_usage == "Possible Use":
                     confidence = "medium"
                 else:
                     confidence = "low"
@@ -1085,18 +1081,18 @@ def main():
     # 统计新格式的使用情况
     definitely_uses = sum(1 for r in results 
                          if r.get("status") == "success"
-                         and r.get("ai_analysis", {}).get("webrtc_usage") == "确定使用")
+                         and r.get("ai_analysis", {}).get("webrtc_usage") == "Confirmed Use")
     possibly_uses = sum(1 for r in results 
                        if r.get("status") == "success"
-                       and r.get("ai_analysis", {}).get("webrtc_usage") == "可能使用")
+                       and r.get("ai_analysis", {}).get("webrtc_usage") == "Possible Use")
     
     print(f"总计: {total}")
     print(f"成功: {success}")
     print(f"失败: {failed}")
     print(f"AI 分析失败: {ai_failed}")
     print(f"包含 WebRTC: {has_webrtc}")
-    print(f"  确定使用: {definitely_uses}")
-    print(f"  可能使用: {possibly_uses}")
+    print(f"  Confirmed Use: {definitely_uses}")
+    print(f"  Possible Use: {possibly_uses}")
     
     # 显示所有批次文件信息
     print(f"\n结果文件:")

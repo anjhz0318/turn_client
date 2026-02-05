@@ -139,6 +139,7 @@ class StandardAbilityTester:
         
         # 分配TCP TURN
         print("\n[1/2] 分配TCP TURN中继地址...")
+        print("[2/2] 创建权限（不进行转发测试）...")
         allocation_result, is_short_term = allocate_tcp_with_fallback(
             server_address, self.username, self.password, self.realm, self.use_tls
         )
@@ -170,24 +171,8 @@ class StandardAbilityTester:
                     results.append((target_ip, target_port, False, "创建权限失败"))
                     continue
                 
-                # 尝试TCP连接
-                connection_id, error_info = tcp_connect(
-                    control_sock, nonce, realm, integrity_key,
-                    peer_ip, target_port, self.username, mi_algorithm
-                )
-                
-                if connection_id:
-                    print(f"[+] TCP连接成功: {target_ip}:{target_port}")
-                    results.append((target_ip, target_port, True, "连接成功"))
-                else:
-                    error_msg = error_info.get('message', '未知错误') if error_info else '未知错误'
-                    # 447错误和超时可能意味着服务器尝试连接但失败，这证明有转发能力
-                    if '447' in error_msg or 'Timeout' in error_msg:
-                        print(f"[!] TCP连接失败但服务器尝试转发: {target_ip}:{target_port} - {error_msg}")
-                        results.append((target_ip, target_port, True, f"转发尝试({error_msg})"))
-                    else:
-                        print(f"[-] TCP连接失败: {target_ip}:{target_port} - {error_msg}")
-                        results.append((target_ip, target_port, False, error_msg))
+                print(f"[+] 创建权限成功: {target_ip}:{target_port}（仅测试到创建权限，不进行转发）")
+                results.append((target_ip, target_port, True, "创建权限成功"))
         
         finally:
             control_sock.close()
@@ -230,7 +215,8 @@ class StandardAbilityTester:
         server_address = (self.server_ip, self.turn_port)
         
         # 分配UDP或TCP+UDP TURN
-        print(f"\n[1/3] 分配{'TCP+UDP' if use_tcp_udp else 'UDP'} TURN中继地址...")
+        print(f"\n[1/2] 分配{'TCP+UDP' if use_tcp_udp else 'UDP'} TURN中继地址...")
+        print(f"[2/2] 创建权限（不进行转发测试）...")
         if use_tcp_udp:
             allocation_result, is_short_term = allocate_tcp_udp_with_fallback(
                 server_address, self.username, self.password, self.realm,
@@ -284,102 +270,8 @@ class StandardAbilityTester:
                     else:
                         raise
                 
-                # 绑定通道（为每个目标使用不同的通道号）
-                import random
-                channel_number = random.randint(0x4000, 0x4FFF)
-                try:
-                    # 在TCP+UDP模式下，channel_bind需要特殊处理
-                    # 因为sock是TCP socket，但channel_bind可能误判为UDP
-                    if use_tcp_udp:
-                        # 临时设置超时，避免阻塞
-                        original_timeout = sock.gettimeout()
-                        sock.settimeout(10)
-                        try:
-                            # 尝试调用channel_bind，如果失败则手动处理
-                            if not channel_bind(
-                                sock, nonce, realm, integrity_key,
-                                peer_ip, target_port, channel_number, actual_server_address,
-                                self.username, mi_algorithm,
-                                clear_buffer=use_tcp_udp  # 在TCP+UDP模式下清空缓冲区
-                            ):
-                                print(f"[-] 绑定通道失败: {target_ip}:{target_port}")
-                                results.append((target_ip, target_port, False, "绑定通道失败"))
-                                continue
-                        except (socket.timeout, AttributeError, OSError) as e:
-                            # 如果channel_bind因为socket类型问题失败，尝试手动处理
-                            print(f"[!] channel_bind异常，尝试手动处理: {e}")
-                            # 对于TCP+UDP，如果channel_bind失败，我们仍然可以尝试发送数据
-                            # 因为某些服务器可能允许未绑定的通道
-                            print(f"[!] 跳过通道绑定，直接尝试发送数据")
-                        finally:
-                            sock.settimeout(original_timeout)
-                    else:
-                        if not channel_bind(
-                            sock, nonce, realm, integrity_key,
-                            peer_ip, target_port, channel_number, actual_server_address,
-                            self.username, mi_algorithm,
-                            clear_buffer=use_tcp_udp  # 在TCP+UDP模式下清空缓冲区
-                        ):
-                            print(f"[-] 绑定通道失败: {target_ip}:{target_port}")
-                            results.append((target_ip, target_port, False, "绑定通道失败"))
-                            continue
-                except Exception as e:
-                    print(f"[-] 绑定通道异常: {target_ip}:{target_port} - {e}")
-                    # 对于TCP+UDP，即使绑定失败也尝试发送数据
-                    if not use_tcp_udp:
-                        results.append((target_ip, target_port, False, f"绑定通道异常: {e}"))
-                        continue
-                    else:
-                        print(f"[!] TCP+UDP模式下绑定失败，但继续尝试发送数据")
-                
-                # 发送DNS查询
-                query_packet, transaction_id = self.build_dns_query()
-                if use_tcp_udp:
-                    if not channel_data_tcp(sock, channel_number, query_packet, actual_server_address):
-                        results.append((target_ip, target_port, False, "发送DNS查询失败"))
-                        continue
-                else:
-                    if not channel_data(sock, channel_number, query_packet, actual_server_address):
-                        results.append((target_ip, target_port, False, "发送DNS查询失败"))
-                        continue
-                
-                # 等待响应
-                print(f"[+] DNS查询已发送，等待响应...")
-                sock.settimeout(5)
-                try:
-                    if use_tcp_udp:
-                        data = sock.recv(1024)
-                    else:
-                        data, addr = sock.recvfrom(1024)
-                    
-                    # 检查是否是ChannelData消息
-                    if len(data) >= 4:
-                        recv_channel = struct.unpack("!H", data[:2])[0]
-                        data_length = struct.unpack("!H", data[2:4])[0]
-                        
-                        if recv_channel == channel_number and len(data) >= 4 + data_length:
-                            dns_data = data[4:4+data_length]
-                            dns_response = self.parse_dns_response(dns_data)
-                            if dns_response:
-                                print(f"[+] 收到DNS响应: {dns_response['answers']} 个答案")
-                                results.append((target_ip, target_port, True, f"收到响应({dns_response['answers']}个答案)"))
-                            else:
-                                print(f"[+] 收到数据但解析失败")
-                                results.append((target_ip, target_port, False, "DNS响应解析失败"))
-                        else:
-                            print(f"[+] 收到非预期的通道数据")
-                            results.append((target_ip, target_port, False, "非预期的通道数据"))
-                    else:
-                        print(f"[+] 收到数据但长度不足")
-                        results.append((target_ip, target_port, False, "数据长度不足"))
-                
-                except socket.timeout:
-                    print(f"[!] 等待DNS响应超时（但查询可能已成功转发）")
-                    # 超时不意味着失败，可能目标服务器没有响应或响应被过滤
-                    results.append((target_ip, target_port, True, "查询已发送（超时无响应）"))
-                except Exception as e:
-                    print(f"[-] 接收响应错误: {e}")
-                    results.append((target_ip, target_port, False, f"接收错误: {e}"))
+                print(f"[+] 创建权限成功: {target_ip}:{target_port}（仅测试到创建权限，不进行转发）")
+                results.append((target_ip, target_port, True, "创建权限成功"))
         
         finally:
             sock.close()

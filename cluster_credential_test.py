@@ -81,24 +81,24 @@ def test_allocation(server_ip: str, server_port: int, username: str, password: s
         result['udp'] = False
         result['udp_error'] = 'UDP test skipped for TLS port (443/5349)'
     else:
-        # 测试UDP
-        try:
-            allocation_result, is_short_term = allocate_with_fallback(
-                server_address, username, password, realm, None, use_tls
-            )
-            if allocation_result:
-                result['udp'] = True
-                # 关闭socket
-                sock = allocation_result[0]
-                if sock:
-                    try:
-                        sock.close()
-                    except:
-                        pass
-            else:
-                result['udp_error'] = 'Allocation failed'
-        except Exception as e:
-            result['udp_error'] = str(e)
+    # 测试UDP
+    try:
+        allocation_result, is_short_term = allocate_with_fallback(
+            server_address, username, password, realm, None, use_tls
+        )
+        if allocation_result:
+            result['udp'] = True
+            # 关闭socket
+            sock = allocation_result[0]
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+        else:
+            result['udp_error'] = 'Allocation failed'
+    except Exception as e:
+        result['udp_error'] = str(e)
     
     # 测试TCP
     try:
@@ -184,7 +184,7 @@ def test_cluster_servers(cluster_data: Dict, domain: str, server_port: int,
     
     print(f"\n[+] 开始测试 {total} 个TURN服务器（多线程）...")
     print("=" * 70)
-
+    
     # 限制最大线程数，避免在大集群时创建过多线程
     worker_count = max(1, min(max_workers, total))
 
@@ -192,7 +192,7 @@ def test_cluster_servers(cluster_data: Dict, domain: str, server_port: int,
         idx, ip = idx_ip
         print(f"\n[{idx}/{total}] 测试 {ip}:{server_port}")
         result = test_allocation(ip, server_port, username, password, realm, use_tls, sni_hostname)
-
+        
         # 打印简要结果
         capabilities = []
         if result['udp']:
@@ -201,7 +201,7 @@ def test_cluster_servers(cluster_data: Dict, domain: str, server_port: int,
             capabilities.append('TCP')
         if result['tcp_udp']:
             capabilities.append('TCP+UDP')
-
+        
         if capabilities:
             print(f"    [+] 成功: {', '.join(capabilities)}")
         else:
@@ -213,11 +213,11 @@ def test_cluster_servers(cluster_data: Dict, domain: str, server_port: int,
             if result['tcp_udp_error']:
                 errors.append(f"TCP+UDP: {result['tcp_udp_error']}")
             print(f"    [-] 失败: {', '.join(errors) if errors else 'All failed'}")
-
+        
         # 轻微延迟，避免在极端情况下压垮本机/网络
         if delay > 0:
             time.sleep(delay)
-
+    
         return idx, result
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:

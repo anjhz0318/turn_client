@@ -64,7 +64,7 @@ def test_single_domain(domain: str, api_key: str, model: str):
     elements_text_length = len(elements_text)
     print(f"    元素信息文本长度: {elements_text_length} 字符（用于估算 token 消耗）")
     
-    # 两阶段 AI 分析：先用快速模型，如果出错或结果是"可能使用"则用更准确的模型重新判断
+    # 两阶段 AI 分析：先用快速模型，如果出错或结果是"Possible Use"则用更准确的模型重新判断
     print(f"\n[2/3] 第一阶段：使用快速模型 (gemini-2.0-flash-exp) 分析 WebRTC 服务...")
     ai_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.0-flash-exp")
     
@@ -92,7 +92,7 @@ def test_single_domain(domain: str, api_key: str, model: str):
             }
     
     # 解析第一阶段的 JSON 格式
-    webrtc_usage = ai_result.get("webrtc_usage", "未发现使用")
+    webrtc_usage = ai_result.get("webrtc_usage", "No Evidence of Use")
     evidence = ai_result.get("evidence", [])
     reasoning = ai_result.get("reasoning", "")
     
@@ -105,14 +105,14 @@ def test_single_domain(domain: str, api_key: str, model: str):
     if reasoning:
         print(f"    推理过程: {reasoning[:200]}...")  # 限制长度
     
-    # 如果第一次判断结果是"可能使用"，使用更准确的模型重新判断
-    if webrtc_usage == "可能使用":
-        print(f"\n[3/3] 第一阶段结果为'可能使用'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
+    # 如果第一次判断结果是"Possible Use"，使用更准确的模型重新判断
+    if webrtc_usage == "Possible Use":
+        print(f"\n[3/3] 第一阶段结果为'Possible Use'，使用更准确模型 (gemini-2.5-pro) 重新判断...")
         second_result = analyze_webrtc_with_ai(domain, elements_data, api_key, "gemini-2.5-pro")
         if second_result:
             # 以第二次判断的结果为准
             ai_result = second_result
-            webrtc_usage = ai_result.get("webrtc_usage", "未发现使用")
+            webrtc_usage = ai_result.get("webrtc_usage", "No Evidence of Use")
             evidence = ai_result.get("evidence", [])
             reasoning = ai_result.get("reasoning", "")
             print(f"[+] 第二阶段判断完成，以本次结果为准")
@@ -127,12 +127,12 @@ def test_single_domain(domain: str, api_key: str, model: str):
             print(f"[!] 第二阶段判断失败，使用第一阶段结果")
     
     # 将 webrtc_usage 转换为布尔值（用于判断是否需要进行发起通信能力分析）
-    has_webrtc = webrtc_usage in ["确定使用", "可能使用"]
+    has_webrtc = webrtc_usage in ["Confirmed Use", "Possible Use"]
     
     # 根据 webrtc_usage 确定置信度
-    if webrtc_usage == "确定使用":
+    if webrtc_usage == "Confirmed Use":
         confidence = "high"
-    elif webrtc_usage == "可能使用":
+    elif webrtc_usage == "Possible Use":
         confidence = "medium"
     else:
         confidence = "low"
@@ -151,7 +151,7 @@ def test_single_domain(domain: str, api_key: str, model: str):
             "content_preview": elements_data.get("content_preview", "")
         },
         "ai_analysis": {
-            "webrtc_usage": webrtc_usage,  # 新格式：确定使用 | 可能使用 | 未发现使用
+            "webrtc_usage": webrtc_usage,  # 新格式：Confirmed Use | Possible Use | No Evidence of Use
             "has_webrtc": has_webrtc,  # 向后兼容：布尔值
             "confidence": confidence,  # 根据 webrtc_usage 推断的置信度
             "evidence": evidence,  # 新格式：证据列表
