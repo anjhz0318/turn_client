@@ -110,44 +110,48 @@ def release_port(port):
     with ports_lock:
         used_ports.discard(port)
 
-def refresh_allocation(sock, nonce, realm, integrity_key, server_address, username=None, lifetime=None, mi_algorithm=None):
+def refresh_allocation(sock, nonce, realm, integrity_key, server_address, username=None, password=None, lifetime=None, mi_algorithm=None):
     """
     刷新TURN分配
     
     Returns:
-        (success, lifetime_value) 或 (False, None)
+        (success, lifetime_value, nonce, realm, integrity_key) 或
+        (False, None, nonce, realm, integrity_key)
     """
     from turn_utils.turn_client import (
         build_msg_with_short_term_credential,
         build_msg_with_short_term_credential_sha256_only,
         build_msg_with_short_term_credential_sha1_only,
-        USERNAME
+        compute_long_term_hmac_key,
+        USERNAME,
+        PASSWORD
     )
     
     auth_username = username or USERNAME
+    auth_password = password or PASSWORD
     
-    tid = gen_tid()
-    attrs = [
-        stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
-    ]
-    
-    if realm is not None:
-        attrs.append(stun_attr(STUN_ATTR_REALM, realm))
-    if nonce is not None:
-        attrs.append(stun_attr(STUN_ATTR_NONCE, nonce))
-    
-    if lifetime is not None:
-        attrs.append(stun_attr(STUN_ATTR_LIFETIME, struct.pack("!I", lifetime)))
-    
-    if nonce is None and realm is None:
-        if mi_algorithm == 'sha256':
-            req = build_msg_with_short_term_credential_sha256_only(STUN_REFRESH_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
-        elif mi_algorithm == 'sha1':
-            req = build_msg_with_short_term_credential_sha1_only(STUN_REFRESH_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
-        else:
-            req = build_msg_with_short_term_credential(STUN_REFRESH_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
-    else:
-        req = build_msg(STUN_REFRESH_REQUEST, tid, attrs, integrity_key, add_fingerprint=True)
+    def build_refresh_request(current_nonce, current_realm, current_integrity_key):
+        tid = gen_tid()
+        attrs = [
+            stun_attr(STUN_ATTR_USERNAME, auth_username.encode()),
+        ]
+        
+        if current_realm is not None:
+            attrs.append(stun_attr(STUN_ATTR_REALM, current_realm))
+        if current_nonce is not None:
+            attrs.append(stun_attr(STUN_ATTR_NONCE, current_nonce))
+        
+        if lifetime is not None:
+            attrs.append(stun_attr(STUN_ATTR_LIFETIME, struct.pack("!I", lifetime)))
+        
+        if current_nonce is None and current_realm is None:
+            if mi_algorithm == 'sha256':
+                return build_msg_with_short_term_credential_sha256_only(STUN_REFRESH_REQUEST, tid, attrs, current_integrity_key, add_fingerprint=True)
+            elif mi_algorithm == 'sha1':
+                return build_msg_with_short_term_credential_sha1_only(STUN_REFRESH_REQUEST, tid, attrs, current_integrity_key, add_fingerprint=True)
+            else:
+                return build_msg_with_short_term_credential(STUN_REFRESH_REQUEST, tid, attrs, current_integrity_key, add_fingerprint=True)
+        return build_msg(STUN_REFRESH_REQUEST, tid, attrs, current_integrity_key, add_fingerprint=True)
     
     is_tcp_socket = False
     if hasattr(sock, '_sslobj') or sock.__class__.__name__ == 'SSLSocket':
@@ -169,15 +173,20 @@ def refresh_allocation(sock, nonce, realm, integrity_key, server_address, userna
         except (AttributeError, OSError, socket.error):
             pass
     
-    try:
+    def send_refresh_request(req):
         if is_tcp_socket:
             sock.send(req)
             sock.settimeout(10)
-            data = sock.recv(2000)
+            return sock.recv(2000)
         else:
             sock.sendto(req, server_address)
             sock.settimeout(10)
             data, _ = sock.recvfrom(2000)
+            return data
+    
+    try:
+        req = build_refresh_request(nonce, realm, integrity_key)
+        data = send_refresh_request(req)
         
         msg_type, tid, attrs = parse_attrs(data)
         
@@ -185,7 +194,7 @@ def refresh_allocation(sock, nonce, realm, integrity_key, server_address, userna
             lifetime_value = None
             if STUN_ATTR_LIFETIME in attrs:
                 lifetime_value = struct.unpack("!I", attrs[STUN_ATTR_LIFETIME])[0]
-            return True, lifetime_value
+            return True, lifetime_value, nonce, realm, integrity_key
         elif msg_type == STUN_REFRESH_ERROR_RESPONSE:
             # 打印错误信息
             error_code_attr = attrs.get(STUN_ATTR_ERROR_CODE)
@@ -204,6 +213,41 @@ def refresh_allocation(sock, nonce, realm, integrity_key, server_address, userna
                 
                 print(f"[-] Refresh failed ({sock_info}): {error_class}{error_number:02d} {error_text}")
                 
+                # RFC 8656 Section 8.3 / RFC 8489 Section 9.2.5:
+                # Refresh 收到 438 后必须使用响应中的新 NONCE 重试。
+                if error_code_value == 438:
+                    new_nonce = attrs.get(STUN_ATTR_NONCE)
+                    new_realm = attrs.get(STUN_ATTR_REALM) or realm
+                    
+                    if new_nonce and new_realm and (nonce is not None or realm is not None):
+                        print(f"[+] Refresh received 438 Stale Nonce, retrying with new nonce")
+                        new_integrity_key = integrity_key
+                        if new_realm != realm:
+                            new_integrity_key = compute_long_term_hmac_key(auth_username, new_realm, auth_password)
+                        
+                        retry_req = build_refresh_request(new_nonce, new_realm, new_integrity_key)
+                        retry_data = send_refresh_request(retry_req)
+                        retry_msg_type, retry_tid, retry_attrs = parse_attrs(retry_data)
+                        
+                        if retry_msg_type == STUN_REFRESH_SUCCESS_RESPONSE:
+                            lifetime_value = None
+                            if STUN_ATTR_LIFETIME in retry_attrs:
+                                lifetime_value = struct.unpack("!I", retry_attrs[STUN_ATTR_LIFETIME])[0]
+                            return True, lifetime_value, new_nonce, new_realm, new_integrity_key
+                        elif retry_msg_type == STUN_REFRESH_ERROR_RESPONSE:
+                            retry_error_code_attr = retry_attrs.get(STUN_ATTR_ERROR_CODE)
+                            if retry_error_code_attr and len(retry_error_code_attr) >= 4:
+                                retry_error_class = retry_error_code_attr[2]
+                                retry_error_number = retry_error_code_attr[3]
+                                retry_error_text = retry_error_code_attr[4:].decode('utf-8', errors='ignore') if len(retry_error_code_attr) > 4 else ''
+                                print(f"[-] Refresh retry failed ({sock_info}): {retry_error_class}{retry_error_number:02d} {retry_error_text}")
+                            else:
+                                print(f"[-] Refresh retry failed ({sock_info}): Unknown error")
+                        else:
+                            print(f"[-] Refresh retry failed ({sock_info}): Unexpected response type 0x{retry_msg_type:04x}")
+                    else:
+                        print(f"[-] Refresh received 438 Stale Nonce but response did not include usable NONCE/REALM")
+                
                 # 437错误表示allocation不匹配，可能allocation已过期或被删除
                 if error_code_value == 437:
                     print(f"[-] 437 Allocation Mismatch: The allocation may have expired or been deleted. "
@@ -215,7 +259,7 @@ def refresh_allocation(sock, nonce, realm, integrity_key, server_address, userna
                 except:
                     sock_info = "unknown socket"
                 print(f"[-] Refresh failed ({sock_info}): Unknown error")
-            return False, None
+            return False, None, nonce, realm, integrity_key
         else:
             try:
                 sockname = sock.getsockname()
@@ -223,11 +267,11 @@ def refresh_allocation(sock, nonce, realm, integrity_key, server_address, userna
             except:
                 sock_info = "unknown socket"
             print(f"[-] Refresh failed ({sock_info}): Unexpected response type 0x{msg_type:04x}")
-            return False, None
+            return False, None, nonce, realm, integrity_key
     except (socket.timeout, Exception):
-        return False, None
+        return False, None, nonce, realm, integrity_key
 
-def keep_allocation_alive(allocation_info, server_address, username, refresh_interval=300):
+def keep_allocation_alive(allocation_info, server_address, username, refresh_interval=300, password=None):
     """
     保持allocation活跃，定期发送refresh请求
     
@@ -257,9 +301,12 @@ def keep_allocation_alive(allocation_info, server_address, username, refresh_int
                 break
             
             # 使用同一个socket发送refresh，确保5-tuple一致
-            success, lifetime = refresh_allocation(sock, nonce, realm, integrity_key, 
-                                                   server_address, username, 
-                                                   mi_algorithm=mi_algorithm)
+            success, lifetime, new_nonce, new_realm, new_integrity_key = refresh_allocation(
+                sock, nonce, realm, integrity_key,
+                server_address, username,
+                password=password,
+                mi_algorithm=mi_algorithm
+            )
             if not success:
                 # refresh失败，从活跃列表中移除
                 with allocations_lock:
@@ -272,6 +319,10 @@ def keep_allocation_alive(allocation_info, server_address, username, refresh_int
                 if local_port is not None:
                     release_port(local_port)
                 break
+            
+            nonce = new_nonce
+            realm = new_realm
+            integrity_key = new_integrity_key
     except KeyboardInterrupt:
         # 忽略KeyboardInterrupt，让主线程处理
         pass
@@ -845,7 +896,8 @@ def main():
                                 allocation_info,
                                 server_address,
                                 args.username,
-                                args.refresh_interval
+                                args.refresh_interval,
+                                args.password
                             )
                         
                         # 检查是否达到连续失败阈值
@@ -870,7 +922,8 @@ def main():
                             allocation_info,
                             server_address,
                             args.username,
-                            args.refresh_interval
+                            args.refresh_interval,
+                            args.password
                         )
                 except Exception as e:
                     print(f"[!] Error processing pending allocation: {e}")
@@ -937,4 +990,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
